@@ -12,6 +12,24 @@
 [![Docs](https://img.shields.io/badge/docs-14%20chapters%20%C2%B7%20%E4%B8%AD%E8%8B%B1%E5%8F%8C%E8%AF%AD-blue?style=flat-square)](docs/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
+### ▶ 43 秒讲清楚整件事
+
+<a href="assets/promo-98260.mp4"><img src="assets/promo-poster.jpg" alt="观看 43 秒短片" width="100%"></a>
+
+*点封面播放 · [MP4 直链](assets/promo-98260.mp4) · 配乐由 [scripts/make-bgm.py](scripts/make-bgm.py) 合成，可自行替换*
+
+| 时间 | 讲什么 |
+|---|---|
+| `0:00` | 锁定 bootloader → 完整 ROOT |
+| `0:05` | 公开 exploit 失败：`timers=0`、`task_recs=0` |
+| `0:11` | ★ **核心**：`0x195d48` vs `0x015d48`，差 `0x80000` |
+| `0:20` | 修法：四个候选自校准，只有 `0x080000` 命中 512 |
+| `0:27` | 三段链条：fake_cred → selinux=0 → uid=0 |
+| `0:34` | `uid=0(root)` · 0 分区写入 · bootloader 仍锁定 |
+| `0:40` | 仓库地址 |
+
+---
+
 > **一句话**：在 bootloader 保持锁定、全程零分区写入、设备从未变砖的前提下，
 > 用 `CVE-2026-98260` 拿到了 `uid=0` + `u:r:ksu:s0` + 完整 capability + KernelSU。
 

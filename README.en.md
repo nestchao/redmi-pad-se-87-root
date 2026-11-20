@@ -12,6 +12,24 @@
 [![Docs](https://img.shields.io/badge/docs-14%20chapters%20%C2%B7%20EN%2BZH-blue?style=flat-square)](docs/en/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
+### ▶ The 43-second film
+
+<a href="assets/promo-98260.mp4"><img src="assets/promo-poster.jpg" alt="Watch the 43-second film" width="100%"></a>
+
+*Click the poster to play · [direct MP4](assets/promo-98260.mp4) · score synthesised by [scripts/make-bgm.py](scripts/make-bgm.py) and free to replace*
+
+| Time | Beat |
+|---|---|
+| `0:00` | Locked bootloader → full ROOT |
+| `0:05` | The public exploit fails: `timers=0`, `task_recs=0` |
+| `0:11` | ★ **The core**: `0x195d48` vs `0x015d48`, off by `0x80000` |
+| `0:20` | The fix: four candidates, only `0x080000` matches 512 |
+| `0:27` | The chain: fake_cred → selinux=0 → uid=0 |
+| `0:34` | `uid=0(root)` · 0 partition writes · bootloader still LOCKED |
+| `0:40` | Repository |
+
+---
+
 > **One line:** full kernel-level root (`uid=0`, `u:r:ksu:s0`, complete capability set,
 > KernelSU loaded) on a device whose bootloader stayed locked — with zero partition writes
 > and zero bricks.
