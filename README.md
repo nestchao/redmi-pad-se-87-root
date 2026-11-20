@@ -1,5 +1,7 @@
 # Redmi Pad SE 8.7 免解锁 ROOT 研究全记录
 
+[**中文**](README.md) · [English](README.en.md)
+
 > 在 **bootloader 保持锁定、全程零分区写入、设备未变砖** 的前提下，
 > 通过 `CVE-2026-98260` 拿到 **完整内核级 ROOT**（`uid=0` + `u:r:ksu:s0` + 完整 capability + KernelSU）。
 
