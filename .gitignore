@@ -1,0 +1,6 @@
+*.exe
+*.o
+*.tmp
+recon/
+build/
+*.log
