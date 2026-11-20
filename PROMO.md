@@ -10,6 +10,25 @@
 
 ---
 
+## 📹 已经有短片了
+
+发帖时**优先带视频**，转发率比纯链接高得多。
+
+| 文件 | 直链 |
+|---|---|
+| 43 秒短片（1920×1080, 30fps） | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-98260.mp4 |
+| 封面图 | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-poster.jpg |
+| 只取音轨（自己重剪不同语言版） | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-score.wav |
+
+**下面所有文案里，把「仓库链接」换成「视频 + 仓库链接」效果更好。**
+比如 X 上发视频推文，正文只留两句 + 链接。
+
+**竖版说明**：目前只有 16:9。抖音/小红书要 9:16，需要重排一遍版式——
+工程是纯 HTML + GSAP，改起来不慢，但**文字全在左侧、右侧会空**，
+竖版必须重新设计构图（不能简单裁切）。
+
+---
+
 ## 📌 仓库信息
 
 ```

@@ -11,6 +11,26 @@
 
 ---
 
+## 📹 There is a film now
+
+**Lead with the video.** Video posts travel much further than link-only posts.
+
+| File | Direct URL |
+|---|---|
+| 43-second film (1920×1080, 30 fps) | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-98260.mp4 |
+| Poster frame | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-poster.jpg |
+| Score only (for your own re-cut / other languages) | https://github.com/nestchao/redmi-pad-se-87-root/releases/download/v1.2.0/promo-score.wav |
+
+**Every post below works better with the film attached + the repo link** rather than the
+repo link alone. On X, post the video natively and put the link in the reply.
+
+**Note on vertical:** only 16:9 exists so far. Reels / Shorts / 小红书 need 9:16, and that
+is not a crop — the layouts are left-anchored, so a vertical cut would leave the right half
+empty. The project is plain HTML + GSAP, so a vertical pass means re-blocking each scene,
+not just resizing the canvas.
+
+---
+
 ## 📌 Repo facts
 
 ```
