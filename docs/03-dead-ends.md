@@ -15,7 +15,7 @@
   - [A3. DirtyFrag / Dirty Pipe](#a3-dirtyfrag--dirty-pipe)
   - [A4. 其他 CVE](#a4-其他-cve)
 - [B. 厂商服务类](#b-厂商服务类)
-  - [B1. mqsas（重点，三处封堵）](#b1-mqas重点三处封堵)
+  - [B1. mqsas（重点，三处封堵）](#b1-mqsas重点三处封堵)
   - [B2. Magica](#b2-magica)
 - [C. MTK 启动链类](#c-mtk-启动链类)
   - [C1. BROM / mtkclient / penumbra](#c1-brom--mtkclient--penumbra)

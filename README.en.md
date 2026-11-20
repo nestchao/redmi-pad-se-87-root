@@ -246,6 +246,9 @@ Everything is in [`assets/`](assets/), free to reuse when sharing:
 
 Regenerate: `python scripts/make-assets.py`
 
+**Want to help spread the word?** [`PROMO.md`](PROMO.en.md) has copy-paste posts for
+Reddit / XDA / HN / X / Telegram plus awesome-list submission entries.
+
 ---
 
 ## Risk

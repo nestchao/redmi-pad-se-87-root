@@ -1,6 +1,6 @@
 # Promo Kit
 
-[中文](../PROMO.md) · **English**
+[中文](PROMO.md) · **English**
 
 > The value of this repo is **the KASLR alignment trap**, not just "one tablet got rooted".
 > So the pitch should focus on the *universal porting pitfall* —

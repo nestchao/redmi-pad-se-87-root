@@ -241,6 +241,9 @@ adb shell su -c id
 
 重新生成：`python scripts/make-assets.py`
 
+**想帮忙传播？** [`PROMO.md`](PROMO.md) 里有可直接复制的多平台文案（Reddit / XDA / HN / X / Telegram / V2EX / 酷安 / 知乎），
+以及 awesome-list 的投递条目。
+
 ---
 
 ## 风险

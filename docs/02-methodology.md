@@ -158,7 +158,7 @@ io_uring       45 条
 bpf           202 条
 ```
 
-**其中 binder 那两条我们判断很可能仍未修补**（见 [03-dead-ends.md](03-dead-ends.md#binder-的补丁)），
+**其中 binder 那两条我们判断很可能仍未修补**（见 [03-dead-ends.md](03-dead-ends.md#binder-的两个-uaf66145-修)），
 只是工程量大所以没继续。
 
 ---

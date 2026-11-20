@@ -1,6 +1,6 @@
 # 传播素材包 · Promo Kit
 
-[中文](PROMO.md) · [English](en/PROMO.md)
+[中文](PROMO.md) · [English](PROMO.en.md)
 
 > 这个仓库的价值在于**那个 KASLR 对齐的坑**，而不只是「某台平板能 root」。
 > 所以传播的重点应该放在「移植别人 exploit 时容易踩的通用陷阱」——
