@@ -7,6 +7,10 @@
 > device, while the upstream binary succeeds.
 > If you are porting someone else's kernel exploit, this chapter will very likely help you
 > locate the problem.
+>
+> 📌 **Reported upstream**: [kpgc10kai/Shark#6](https://github.com/kpgc10kai/Shark/issues/6)
+> — minimal patch, file:line locations, and a cheaper way to derive the offset than
+> sweeping four candidates.
 
 ---
 
