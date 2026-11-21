@@ -7,6 +7,33 @@
 
 ---
 
+## ⚡ Quick path: one command
+
+If you would rather not type it out, the repository ships a script (Windows / PowerShell):
+
+```powershell
+.\scripts\root.ps1                 # after a reboot: push -> self-test -> exploit (retried) -> verify
+.\scripts\root.ps1 -ProbeOnly      # self-test only; the UAF is not triggered
+.\scripts\root.ps1 -MaxAttempts 8  # when the odds are not on your side
+```
+
+What it does in each situation:
+
+| Situation | Behaviour |
+|---|---|
+| kernel string does not match | exits immediately instead of guessing |
+| `/data/local/tmp` was cleaned | compares SHA256 and re-pushes only what is missing or stale |
+| already rooted | exits early (`-Force` re-runs anyway) |
+| `--auto` fails | retries automatically — the last stage is probabilistic |
+| a verification step fails | names which one |
+
+**It never writes a partition, never touches the bootloader, and never kills the parked
+holder process.**
+
+The manual walkthrough follows, for when you want to know what each step actually does.
+
+---
+
 ## 0. Scope check
 
 ```bash
