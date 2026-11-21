@@ -30,6 +30,8 @@
 
 ---
 
+> 🧭 **想搞懂「为什么一开始连续失败」？** → [交互式图解：拿到参照之前的那几十轮](https://nestchao.github.io/redmi-pad-se-87-root/why-we-failed.html)
+
 > **一句话**：在 bootloader 保持锁定、全程零分区写入、设备从未变砖的前提下，
 > 用 `CVE-2026-98260` 拿到了 `uid=0` + `u:r:ksu:s0` + 完整 capability + KernelSU。
 

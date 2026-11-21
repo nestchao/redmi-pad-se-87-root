@@ -30,6 +30,8 @@
 
 ---
 
+> 🧭 **Wondering why the first dozens of attempts all failed?** → [interactive explainer](https://nestchao.github.io/redmi-pad-se-87-root/why-we-failed.html)
+
 > **One line:** full kernel-level root (`uid=0`, `u:r:ksu:s0`, complete capability set,
 > KernelSU loaded) on a device whose bootloader stayed locked — with zero partition writes
 > and zero bricks.
