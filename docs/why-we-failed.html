@@ -1,0 +1,1284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>为什么我们失败了几十轮 · 拿到「参照」之前的 CVE-2026-98260</title>
+<style>
+  :root{
+    --bg:#07090e;
+    --bg2:#0b0f16;
+    --panel:#0f141d;
+    --panel2:#131924;
+    --line:#1e2733;
+    --line2:#2a3546;
+    --fg:#e6edf3;
+    --dim:#8b949e;
+    --dim2:#6a7382;
+    --dead:#f85149;
+    --dead-bg:rgba(248,81,73,.10);
+    --alive:#3fb950;
+    --alive-bg:rgba(63,185,80,.10);
+    --unk:#d29922;
+    --unk-bg:rgba(210,153,34,.10);
+    --info:#58a6ff;
+    --info-bg:rgba(88,166,255,.10);
+    --prim:#a371f7;
+    --prim-bg:rgba(163,113,247,.10);
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+    --maxw:1120px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--sans);font-size:17px;line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      linear-gradient(rgba(88,166,255,.028) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(88,166,255,.028) 1px,transparent 1px);
+    background-size:64px 64px;
+  }
+  ::selection{background:rgba(88,166,255,.28)}
+  a{color:var(--info);text-decoration:none;border-bottom:1px solid rgba(88,166,255,.3)}
+  a:hover{border-bottom-color:var(--info)}
+  code{font-family:var(--mono);font-size:.9em;background:rgba(110,118,129,.16);
+       padding:.1em .38em;border-radius:4px;color:#d6dde6}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+
+  /* ---------- progress ---------- */
+  #bar{position:fixed;top:0;left:0;height:2px;width:0;z-index:100;
+       background:linear-gradient(90deg,var(--info),var(--prim));transition:width .1s linear}
+  nav.toc{position:fixed;right:22px;top:50%;transform:translateY(-50%);z-index:90;
+          display:flex;flex-direction:column;gap:11px;opacity:.5}
+  nav.toc:hover{opacity:1}
+  nav.toc a{display:block;width:9px;height:9px;border-radius:50%;border:1.5px solid var(--dim2);
+            border-bottom:1.5px solid var(--dim2);transition:all .2s}
+  nav.toc a.on{background:var(--info);border-color:var(--info);transform:scale(1.35)}
+  @media(max-width:1180px){nav.toc{display:none}}
+
+  /* ---------- hero ---------- */
+  header.hero{padding:96px 0 64px;position:relative;overflow:hidden}
+  header.hero:after{content:"";position:absolute;left:-180px;top:-160px;width:780px;height:780px;
+    background:radial-gradient(circle,rgba(88,166,255,.11),transparent 62%);pointer-events:none}
+  .kicker{font-family:var(--mono);font-size:12.5px;letter-spacing:.24em;color:var(--dim2);
+          text-transform:uppercase;margin-bottom:22px}
+  h1{font-size:clamp(30px,4.6vw,54px);line-height:1.14;letter-spacing:-.022em;margin:0 0 22px;font-weight:800}
+  h1 .mute{color:var(--dim2)}
+  h1 .hot{color:var(--dead)}
+  .lede{font-size:clamp(16px,1.55vw,19.5px);color:var(--dim);max-width:800px;margin:0 0 14px}
+  .lede b{color:var(--fg);font-weight:700}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
+         border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:42px 0 0}
+  .stat{background:var(--panel);padding:20px 20px 18px}
+  .stat .n{font-family:var(--mono);font-size:31px;font-weight:700;line-height:1.1;letter-spacing:-.02em}
+  .stat .l{font-size:12.5px;color:var(--dim2);margin-top:7px;letter-spacing:.02em}
+  @media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}
+
+  /* ---------- sections ---------- */
+  section{padding:76px 0 20px;border-top:1px solid var(--line)}
+  section:first-of-type{border-top:0}
+  .snum{font-family:var(--mono);font-size:12.5px;color:var(--dim2);letter-spacing:.2em;margin-bottom:12px}
+  h2{font-size:clamp(24px,3vw,35px);line-height:1.2;letter-spacing:-.018em;margin:0 0 16px;font-weight:800}
+  h3{font-size:20px;margin:30px 0 10px;font-weight:700;letter-spacing:-.01em}
+  p{margin:0 0 16px;color:#c6ced8}
+  p.dim{color:var(--dim)}
+  ul,ol{margin:0 0 16px;padding-left:22px;color:#c6ced8}
+  li{margin:0 0 8px}
+  .note{border-left:2px solid var(--line2);padding:2px 0 2px 18px;color:var(--dim);font-size:15.5px;margin:20px 0}
+  .reveal{opacity:0;transform:translateY(12px);transition:opacity .45s ease,transform .45s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){
+    .reveal{opacity:1;transform:none;transition:none}
+    html{scroll-behavior:auto}
+  }
+
+  /* ---------- callout ---------- */
+  .callout{border:1px solid var(--line2);border-radius:12px;padding:22px 24px;margin:26px 0;
+           background:linear-gradient(180deg,var(--panel2),var(--panel))}
+  .callout.prim{border-color:rgba(163,113,247,.42);background:linear-gradient(180deg,rgba(163,113,247,.09),var(--panel))}
+  .callout.dead{border-color:rgba(248,81,73,.38);background:linear-gradient(180deg,rgba(248,81,73,.07),var(--panel))}
+  .callout.alive{border-color:rgba(63,185,80,.38);background:linear-gradient(180deg,rgba(63,185,80,.07),var(--panel))}
+  .callout .ct{font-family:var(--mono);font-size:12px;letter-spacing:.2em;color:var(--dim2);
+               text-transform:uppercase;margin-bottom:10px}
+  .callout p:last-child{margin-bottom:0}
+
+  /* ---------- two doors ---------- */
+  .doors{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:28px 0 8px}
+  @media(max-width:840px){.doors{grid-template-columns:1fr}}
+  .door{border:1px solid var(--line2);border-radius:14px;background:var(--panel);overflow:hidden;
+        transition:border-color .25s,transform .25s}
+  .door:hover{transform:translateY(-2px)}
+  .door.a{border-color:rgba(248,81,73,.34)}
+  .door.b{border-color:rgba(163,113,247,.34)}
+  .door .dh{padding:20px 22px 16px;border-bottom:1px solid var(--line);position:relative}
+  .door .dtitle{font-size:19px;font-weight:800;letter-spacing:-.012em;margin:0 0 4px}
+  .door .dsub{font-size:13.5px;color:var(--dim2);font-family:var(--mono)}
+  .door .state{position:absolute;right:18px;top:18px;font-family:var(--mono);font-size:11.5px;
+               letter-spacing:.14em;padding:4px 10px;border-radius:99px}
+  .door.a .state{color:var(--dead);background:var(--dead-bg);border:1px solid rgba(248,81,73,.3)}
+  .door.b .state{color:var(--prim);background:var(--prim-bg);border:1px solid rgba(163,113,247,.3)}
+  .door .db{padding:18px 22px 20px}
+  .lock{display:flex;align-items:flex-start;gap:11px;padding:9px 0;border-bottom:1px dashed rgba(42,53,70,.85)}
+  .lock:last-child{border-bottom:0}
+  .lock .dot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;margin-top:9px;background:var(--dead)}
+  .lock.b .dot{background:var(--prim)}
+  .lock .lt{font-size:14.5px;line-height:1.55;color:#c6ced8}
+  .lock .lt b{color:var(--fg)}
+  .lock .lt em{font-style:normal;color:var(--dim2);font-family:var(--mono);font-size:12.5px}
+
+  /* ---------- trust chain ---------- */
+  .chain{margin:26px 0 10px}
+  .cstage{display:flex;align-items:stretch;gap:0;border:1px solid var(--line);border-radius:10px;
+          background:var(--panel);margin-bottom:8px;overflow:hidden;cursor:pointer;
+          transition:border-color .2s,background .2s}
+  .cstage:hover{border-color:var(--line2);background:var(--panel2)}
+  .cstage.open{border-color:rgba(88,166,255,.5);background:var(--panel2)}
+  .cstage .idx{flex:0 0 52px;display:flex;align-items:center;justify-content:center;
+               font-family:var(--mono);font-size:12.5px;color:var(--dim2);border-right:1px solid var(--line)}
+  .cstage .nm{flex:1 1 auto;padding:14px 18px}
+  .cstage .nm .t{font-weight:700;font-size:16px;letter-spacing:-.008em}
+  .cstage .nm .s{font-size:12.5px;color:var(--dim2);font-family:var(--mono);margin-top:2px}
+  .cstage .vd{flex:0 0 auto;padding:14px 18px 14px 0;display:flex;align-items:center}
+  .pill{font-family:var(--mono);font-size:11px;letter-spacing:.1em;padding:3px 9px;border-radius:99px;
+        white-space:nowrap}
+  .pill.dead{color:var(--dead);background:var(--dead-bg);border:1px solid rgba(248,81,73,.3)}
+  .pill.alive{color:var(--alive);background:var(--alive-bg);border:1px solid rgba(63,185,80,.32)}
+  .pill.unk{color:var(--unk);background:var(--unk-bg);border:1px solid rgba(210,153,34,.32)}
+  .pill.info{color:var(--info);background:var(--info-bg);border:1px solid rgba(88,166,255,.3)}
+  .pill.prim{color:var(--prim);background:var(--prim-bg);border:1px solid rgba(163,113,247,.32)}
+  .cdetail{display:none;padding:0 0 2px 52px}
+  .cdetail.show{display:block;animation:fade .25s ease}
+  .cdetail .inner{border:1px solid var(--line);border-top:0;border-radius:0 0 10px 10px;
+                  background:var(--bg2);padding:16px 20px;margin-top:-8px;margin-bottom:8px}
+  @keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+
+  /* ---------- funnel ---------- */
+  .funnel{margin:26px 0 8px}
+  .frow{display:flex;align-items:center;gap:16px;margin-bottom:12px}
+  .frow .fl{flex:0 0 190px;font-size:14px;color:var(--dim);text-align:right}
+  .frow .fb{flex:1 1 auto;height:34px;background:rgba(110,118,129,.09);border-radius:6px;overflow:hidden;position:relative}
+  .frow .fb i{position:absolute;left:0;top:0;height:100%;width:0;border-radius:6px;
+              transition:width 1.1s cubic-bezier(.2,.8,.2,1)}
+  .frow .fn{flex:0 0 110px;font-family:var(--mono);font-size:15px;font-weight:700}
+  @media(max-width:700px){.frow{flex-wrap:wrap}.frow .fl{flex:1 1 100%;text-align:left}}
+
+  /* ---------- dead-end cards ---------- */
+  .filters{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 20px}
+  .filters button{font-family:var(--mono);font-size:12.5px;letter-spacing:.04em;padding:7px 14px;
+    border-radius:99px;border:1px solid var(--line2);background:transparent;color:var(--dim);
+    cursor:pointer;transition:all .18s}
+  .filters button:hover{color:var(--fg);border-color:var(--dim2)}
+  .filters button.on{background:var(--info);border-color:var(--info);color:#06202e;font-weight:700}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:840px){.cards{grid-template-columns:1fr}}
+  .card{border:1px solid var(--line);border-radius:11px;background:var(--panel);padding:17px 19px;
+        cursor:pointer;transition:border-color .2s,background .2s;position:relative}
+  .card:hover{border-color:var(--line2);background:var(--panel2)}
+  .card.hide{display:none}
+  .card .ch{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+  .card .ctitle{font-weight:700;font-size:15.5px;letter-spacing:-.008em;line-height:1.4}
+  .card .cbadge{flex:0 0 auto}
+  .card .claim{font-size:13.5px;color:var(--dim2);margin-top:6px;line-height:1.55}
+  .card .kill{display:none;margin-top:13px;padding-top:13px;border-top:1px dashed var(--line2);
+              font-size:13.5px;line-height:1.6;color:#c6ced8}
+  .card .kill.show{display:block;animation:fade .2s ease}
+  .card .kill b{color:var(--dead)}
+  .card .kill code{font-size:12px}
+  .card .more{margin-top:12px;padding-top:9px;border-top:1px solid var(--line);
+              text-align:right;font-family:var(--mono);font-size:11px;color:var(--dim2);
+              letter-spacing:.06em}
+
+  /* ---------- toggle compare ---------- */
+  .cmp{border:1px solid var(--line2);border-radius:12px;overflow:hidden;margin:24px 0}
+  .cmp .tabs{display:flex;border-bottom:1px solid var(--line);background:var(--panel2)}
+  .cmp .tabs button{flex:1 1 0;padding:13px 16px;background:transparent;border:0;color:var(--dim);
+    font-family:var(--mono);font-size:13px;letter-spacing:.04em;cursor:pointer;transition:all .18s;position:relative}
+  .cmp .tabs button.on{color:var(--fg);background:var(--panel)}
+  .cmp .tabs button.on:after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--info)}
+  .cmp .pane{display:none;padding:20px 22px}
+  .cmp .pane.on{display:block;animation:fade .2s ease}
+  .verdict{display:flex;align-items:center;gap:12px;padding:13px 16px;border-radius:9px;margin-top:16px;font-size:15px}
+  .verdict.bad{background:var(--dead-bg);border:1px solid rgba(248,81,73,.3)}
+  .verdict.good{background:var(--alive-bg);border:1px solid rgba(63,185,80,.3)}
+  .verdict .vi{font-size:20px;line-height:1}
+  pre{margin:0 0 16px;padding:15px 17px;background:#05080c;border:1px solid var(--line);border-radius:9px;
+      overflow-x:auto;font-family:var(--mono);font-size:12.8px;line-height:1.72;color:#c9d1d9}
+  pre .c{color:#6a7382}
+  pre .r{color:var(--dead)}
+  pre .g{color:var(--alive)}
+  pre .b{color:var(--info)}
+  pre .y{color:var(--unk)}
+  pre .p{color:var(--prim)}
+
+  /* ---------- forge ---------- */
+  .forge{border:1px solid rgba(248,81,73,.34);border-radius:12px;padding:24px;
+         background:linear-gradient(180deg,rgba(248,81,73,.06),var(--panel));margin:24px 0}
+  .forge .fbar{font-family:var(--mono);font-size:13.5px;background:#05080c;border:1px solid var(--line);
+               border-radius:8px;padding:13px 15px;margin:14px 0 16px;overflow:hidden}
+  .forge .fbar .row{display:flex;justify-content:space-between;gap:14px;padding:3px 0}
+  .forge .fbar .k{color:var(--dim2)}
+  .forge .fbar .v{color:var(--fg);text-align:right}
+  .forge button{font-family:var(--mono);font-size:13px;padding:10px 20px;border-radius:8px;
+    border:1px solid rgba(248,81,73,.5);background:rgba(248,81,73,.12);color:#ffb3ae;cursor:pointer;
+    transition:all .18s}
+  .forge button:hover{background:rgba(248,81,73,.2);color:#fff}
+  .forge .tries{font-family:var(--mono);font-size:13px;color:var(--dim);margin-left:14px}
+
+  /* ---------- kmatch ---------- */
+  .kmatch{border:1px solid rgba(163,113,247,.4);border-radius:12px;padding:22px 24px;
+          background:linear-gradient(180deg,rgba(163,113,247,.07),var(--panel));margin:24px 0}
+  .kmrow{display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:center;
+         padding:9px 0;border-bottom:1px dashed rgba(42,53,70,.8);font-size:14px}
+  .kmrow:last-child{border-bottom:0}
+  .kmrow .k{font-family:var(--mono);font-size:12.5px;color:var(--dim2)}
+  .kmrow .v{font-family:var(--mono);font-size:13.5px;word-break:break-all}
+  .kmrow.hit .v{color:var(--alive);font-weight:700}
+  .kmrow .v .hl{background:rgba(63,185,80,.18);border-radius:3px;padding:0 3px}
+
+  /* ---------- kaslr slider ---------- */
+  .kslr{border:1px solid var(--line2);border-radius:12px;padding:24px;background:var(--panel);margin:24px 0}
+  .kslr .lbl{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;color:var(--dim2);
+             text-transform:uppercase;margin-bottom:14px}
+  input[type=range]{width:100%;appearance:none;height:5px;border-radius:99px;background:var(--line2);
+    outline:none;margin:10px 0 6px}
+  input[type=range]::-webkit-slider-thumb{appearance:none;width:20px;height:20px;border-radius:50%;
+    background:var(--prim);border:3px solid var(--bg);box-shadow:0 0 0 1px var(--prim);cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:17px;height:17px;border-radius:50%;background:var(--prim);
+    border:3px solid var(--bg);cursor:pointer}
+  .kslr .ticks{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11.5px;color:var(--dim2)}
+  .kslr .out{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px}
+  @media(max-width:640px){.kslr .out{grid-template-columns:1fr}}
+  .kslr .box{background:#05080c;border:1px solid var(--line);border-radius:9px;padding:15px 17px}
+  .kslr .box .bl{font-family:var(--mono);font-size:11.5px;letter-spacing:.13em;color:var(--dim2);
+                 text-transform:uppercase;margin-bottom:8px}
+  .kslr .box .bv{font-family:var(--mono);font-size:23px;font-weight:700;letter-spacing:-.01em}
+  .kslr .box .bnote{font-size:13px;color:var(--dim2);margin-top:6px}
+
+  /* ---------- table ---------- */
+  table{width:100%;border-collapse:collapse;margin:22px 0;font-size:14.5px}
+  th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;color:var(--dim2);
+     text-transform:uppercase;font-weight:600;background:rgba(110,118,129,.06)}
+  tr:last-child td{border-bottom:0}
+  td.mono{font-family:var(--mono);font-size:13px}
+  tbody tr:hover{background:rgba(110,118,129,.05)}
+
+  footer{padding:70px 0 90px;border-top:1px solid var(--line);color:var(--dim2);font-size:14px}
+  footer a{color:var(--dim)}
+  .quote{border-left:3px solid var(--prim);padding:12px 0 12px 22px;margin:26px 0;
+         font-size:18px;line-height:1.65;color:#dfe6ee}
+  .quote b{color:var(--prim)}
+</style>
+</head>
+<body>
+
+<div id="bar"></div>
+<nav class="toc" aria-label="目录">
+  <a href="#s1" title="结论"></a>
+  <a href="#s2" title="两扇门"></a>
+  <a href="#s3" title="信任链"></a>
+  <a href="#s4" title="候选漏斗"></a>
+  <a href="#s5" title="死路清单"></a>
+  <a href="#s6" title="版本号陷阱"></a>
+  <a href="#s7" title="签名墙"></a>
+  <a href="#s8" title="BROM 墙"></a>
+  <a href="#s9" title="没有参照物"></a>
+  <a href="#s10" title="Shark"></a>
+  <a href="#s11" title="第二堵墙"></a>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="kicker">CVE-2026-98260 · 研究记录 · 前传</div>
+    <h1>为什么在拿到 Shark 之前<br>
+      我们<span class="mute">失败了几十轮</span></h1>
+    <p class="lede">
+      每一次失败我们都有日志、有判据、有结论。但把所有结论排在一起看，
+      会发现它们指向同一件事：<b>不是方法不够多，而是当时我们手里没有任何一个「能走通的路径」作为参照</b>。
+    </p>
+    <p class="lede dim" style="font-size:16px">
+      设备：Redmi Pad SE 8.7 · MT8786 · HyperOS 3.0.303 · Android 16 ·
+      内核 <code>6.6.118-android15-8-gc4127a25dcf3-ab15863337-4k</code> ·
+      SPL 2026-09-01 · bootloader 锁定
+    </p>
+
+    <div class="stats">
+      <div class="stat"><div class="n" style="color:var(--dead)">23</div><div class="l">逐条验证过的路线</div></div>
+      <div class="stat"><div class="n" style="color:var(--dead)">11845</div><div class="l">逐条解析过的内核提交</div></div>
+      <div class="stat"><div class="n" style="color:var(--dim2)">0</div><div class="l">此前的成功次数</div></div>
+      <div class="stat"><div class="n" style="color:var(--alive)">1</div><div class="l">真正存在的缺口</div></div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 1 ============ -->
+<section id="s1">
+  <div class="wrap">
+    <div class="snum reveal">01 — 先给答案</div>
+    <h2 class="reveal">失败有两层原因，而且第二层更致命</h2>
+
+    <p class="reveal">
+      如果只看技术，答案很清楚：<b>这台设备上，所有「绕过验证」的路都被密码学关死了，
+      而所有「利用内核漏洞」的路都被厂商回补掉了</b>。没有原语，就没有下一个动作。
+    </p>
+    <p class="reveal">
+      但这不是我们卡住那么久的真正原因。真正的原因是第二层：
+      <b>因为没有参照物，我们无法区分「这台设备不行」和「我的代码有 bug」</b>。
+      这两种情况下，日志长得一模一样。
+    </p>
+
+    <div class="callout dead reveal">
+      <div class="ct">第一层 · 结构性</div>
+      <p style="margin-bottom:10px">
+        要拿到 uid 0，必须改变内核里的状态（那一份 <code>cred</code>）。通往内核只有两条路：
+      </p>
+      <ul style="margin-bottom:0">
+        <li><b>从启动链进去</b> —— 替换/修补内核镜像。被 AVB2.0 签名 + BROM SLA/DAA 挡住，<span style="color:var(--dead)">密码学关闭</span>。</li>
+        <li><b>从用户态打进去</b> —— 用一个内核内存破坏漏洞拿任意写。被厂商回补挡住，<span style="color:var(--dead)">没有未修补的漏洞</span>。</li>
+      </ul>
+    </div>
+
+    <div class="callout prim reveal">
+      <div class="ct">第二层 · 认知性（真正的原因）</div>
+      <p style="margin-bottom:0">
+        一个 exploit 跑到一半失败，可能是设备不支持、可能是漏洞已修、也可能是你自己的代码写错了三处。
+        <b>没有一份「在这台机器上确实能跑通」的记录，这三种情况在日志里完全无法区分。</b>
+        你只能继续瞎试 —— 那几十轮的实际内容就是这个。
+      </p>
+    </div>
+
+    <div class="quote reveal">
+      Shark 给我们的不是漏洞（<b>第 38 轮我们就已经自己找到 CVE-2026-98260 并打出了 panic</b>）。
+      它给的是一份参照：<b>同一台设备、同一颗内核，有人跑出过 <code>timers=512</code> 和 <code>uid=0</code></b>。
+      从那一刻起，我们的 <code>timers=0</code> 才被判定为「我的 bug」，而不是「设备不行」。
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="s2">
+  <div class="wrap">
+    <div class="snum reveal">02 — 心智模型</div>
+    <h2 class="reveal">通往 uid 0 的两扇门</h2>
+    <p class="reveal">
+      这是整件事最重要的一个模型。两条路都通向同一个目标，但被封堵的方式完全不同 ——
+      而其中<b>一条是数学上不可能，另一条只是暂时没找到</b>。
+    </p>
+
+    <div class="doors">
+      <div class="door a reveal">
+        <div class="dh">
+          <span class="state">CLOSED</span>
+          <h3 style="margin:0 0 4px;font-size:19px">A · 从外部进入</h3>
+          <div class="dsub">替换 kernel / 改 bootloader / 刷分区</div>
+        </div>
+        <div class="db">
+          <div class="lock"><div class="dot"></div><div class="lt"><b>AVB2.0 vbmeta 签名</b><br>
+            <em>RSA-2048 · 只有小米私钥能签 · 无法伪造</em></div></div>
+          <div class="lock"><div class="dot"></div><div class="lt"><b>BootROM SLA + DAA</b><br>
+            <em>没有免费 DA 可加载 · penumbra 文档明说「尤其小米」</em></div></div>
+          <div class="lock"><div class="dot"></div><div class="lt"><b>seccfg 锁定</b><br>
+            <em>要解锁得先能写 · 要写又得先解锁 —— 死循环</em></div></div>
+          <div class="callout dead" style="margin:16px 0 0;padding:14px 16px">
+            <div class="ct" style="margin-bottom:6px">封堵性质</div>
+            <div style="font-size:14.5px">密码学。这里的「不行」是永久的，不是暂时没找到办法。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="door b reveal">
+        <div class="dh">
+          <span class="state">THE ONLY ONE</span>
+          <h3 style="margin:0 0 4px;font-size:19px">B · 从内部改写</h3>
+          <div class="dsub">利用内核漏洞获得任意写 → 直接改 cred</div>
+        </div>
+        <div class="db">
+          <div class="lock b"><div class="dot"></div><div class="lt"><b>不需要伪造任何签名</b><br>
+            <em>因为验证在内核启动前就结束了，之后再不检查</em></div></div>
+          <div class="lock b"><div class="dot"></div><div class="lt"><b>只需要一个原语</b><br>
+            <em>一次可控的内核内存写，就足以把 cred 的 uid 改成 0</em></div></div>
+          <div class="lock b"><div class="dot"></div><div class="lt"><b>唯一的门槛</b><br>
+            <em>这个内核里得真的存在一个未修补、且用户态可达的漏洞</em></div></div>
+          <div class="callout prim" style="margin:16px 0 0;padding:14px 16px">
+            <div class="ct" style="margin-bottom:6px">封堵性质</div>
+            <div style="font-size:14.5px">只是当时没找到。这是可以改变的 —— 后来也确实变了。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note reveal">
+      我们前期绝大多数时间花在 A 上（刷机、BROM、解锁、LK 补丁），
+      而 <b>A 是数学上不可能的</b>。这是最大的一笔沉没成本。
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="s3">
+  <div class="wrap">
+    <div class="snum reveal">03 — 关键边界</div>
+    <h2 class="reveal">信任链上，验证在哪里结束</h2>
+    <p class="reveal">
+      点开每一级看它验什么、谁能通过。注意<b>最关键的一点：验证在内核开始运行之前就已经结束了</b>。
+      之后系统一路相信自己，再也不检查。
+    </p>
+
+    <div class="chain reveal" id="chain"></div>
+
+    <div class="callout reveal" style="margin-top:26px">
+      <div class="ct">这张图解释了一件事</div>
+      <p style="margin-bottom:0">
+        为什么改内核镜像（门 A）需要伪造签名，而改内核内存（门 B）不需要 ——
+        因为两者发生在<b>这条时间轴的不同位置</b>。门 A 在验证<b>之前</b>动手，
+        门 B 在验证<b>之后</b>动手。<b>同一个目标，两种完全不同的难度。</b>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="s4">
+  <div class="wrap">
+    <div class="snum reveal">04 — 我们怎么找门 B</div>
+    <h2 class="reveal">从 11845 条提交里筛候选</h2>
+    <p class="reveal">
+      门 B 需要一个未修补的内核漏洞。我们下载了 <code>6.6.119</code> 到 <code>6.6.162</code>
+      共 44 个 ChangeLog、<b>11845 条提交</b>，全部解析，按子系统归类，再逐层收紧。
+    </p>
+
+    <div class="funnel reveal" id="funnel">
+      <div class="frow"><div class="fl">全部提交</div><div class="fb"><i data-w="100%" style="background:linear-gradient(90deg,#1f6feb,#58a6ff)"></i></div><div class="fn">11845</div></div>
+      <div class="frow"><div class="fl">命中安全关键词</div><div class="fb"><i data-w="22.4%" style="background:linear-gradient(90deg,#1f6feb,#58a6ff)"></i></div><div class="fn">2654</div></div>
+      <div class="frow"><div class="fl">安卓用户态可达</div><div class="fb"><i data-w="2.3%" style="background:linear-gradient(90deg,#8957e5,#a371f7)"></i></div><div class="fn">270</div></div>
+      <div class="frow"><div class="fl">反汇编确认未修补</div><div class="fb"><i data-w="1.1%" style="background:linear-gradient(90deg,#238636,#3fb950)"></i></div><div class="fn" style="color:var(--alive)">很少</div></div>
+    </div>
+
+    <div class="callout dead reveal" style="margin-top:24px">
+      <div class="ct">漏斗底部的残酷现实</div>
+      <p style="margin-bottom:0">
+        270 个候选里，我们重点验证的那一批<b>全部已经修补</b>。小米对安卓内核的回补非常勤 ——
+        很多漏洞在适配这颗内核时就已经把上游修复一起带进来了。
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="s5">
+  <div class="wrap">
+    <div class="snum reveal">05 — 逐条死路</div>
+    <h2 class="reveal">23 条线，点开看它到底死在哪</h2>
+    <p class="reveal dim" style="font-size:16px">
+      每一条都写了「为什么以为能行」和「实际死在哪」。这些判据比结论有用 ——
+      结论会过时，判据不会。
+    </p>
+
+    <div class="filters reveal" id="filters">
+      <button class="on" data-f="all">全部 23</button>
+      <button data-f="kernel">内核 CVE</button>
+      <button data-f="boot">启动链 / BROM</button>
+      <button data-f="vendor">厂商服务</button>
+      <button data-f="unrelated">无关</button>
+      <button data-f="open">还没排除</button>
+    </div>
+
+    <div class="cards reveal" id="cards"></div>
+  </div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="s6">
+  <div class="wrap">
+    <div class="snum reveal">06 — 最大的教训</div>
+    <h2 class="reveal">版本号会说谎</h2>
+    <p class="reveal">
+      这是最贵的一课。我们的内核是 <b>6.6.118</b>，而几乎所有公开资料都按版本号判断漏洞是否存在。
+      按版本号，下面两个「当红」漏洞<b>都该是能用的</b>。
+      但反汇编告诉我们，它们<b>都被提前回补了</b>。
+    </p>
+
+    <div class="cmp reveal" id="cmp">
+      <div class="tabs">
+        <button class="on" data-p="0">CVE-2026-43499 · GhostLock</button>
+        <button data-p="1">CVE-2026-46242 · Bad Epoll</button>
+      </div>
+
+      <div class="pane on" data-pane="0">
+        <p style="font-size:14.5px;color:var(--dim);margin-bottom:16px">
+          <code>rtmutex</code> 的 <code>remove_waiter()</code> 用 <code>current</code> 而不是
+          <code>waiter-&gt;task</code>，导致内核栈上的 <code>rt_mutex_waiter</code> 悬垂（CWE-416）。
+          有至少四个公开实现。
+        </p>
+        <table>
+          <tbody>
+            <tr><td style="width:150px">官方修复版本</td><td class="mono">Linux 6.6.140</td></tr>
+            <tr><td>我们的内核</td><td class="mono">6.6.118 &nbsp;<span style="color:var(--dead)">← 按版本号看，早于修复，应该有漏洞</span></td></tr>
+          </tbody>
+        </table>
+        <p style="font-size:14px;color:var(--dim2);margin-bottom:10px">反汇编 <code>remove_waiter</code>（ARM64 上取 <code>current</code> 只有 <code>mrs sp_el0</code> 一条路）：</p>
+        <pre><span class="c">$ python tools/kcalls.py remove_waiter</span>
+=== remove_waiter @ 0xffffffc08106c758  跨度 0x278 ===
+  <span class="r">（没有任何 mrs sp_el0）</span>
+
+0xffffffc08106c7d4  <span class="b">bl    rb_erase</span>            <span class="c">; waiter-&gt;tree</span>
+0xffffffc08106c7d8  str   x23, [x23]           <span class="c">; RB_CLEAR_NODE</span>
+0xffffffc08106c7dc  str   xzr, [x20, #0x938]   <span class="c">; 清 pi_blocked_on</span>
+                    <span class="c">; x20 来自 [x23, #0x50] ← 从结构体读，不是从 current</span>
+</pre>
+        <div class="verdict bad">
+          <span class="vi">✗</span>
+          <div>函数内 <code>mrs sp_el0</code> 出现 <b>0 次</b> ⇒ 不读 <code>current</code>
+          ⇒ <b>已修复</b>。小米在 6.6.118 里就 backport 了 6.6.140 的修复。</div>
+        </div>
+      </div>
+
+      <div class="pane" data-pane="1">
+        <p style="font-size:14.5px;color:var(--dim);margin-bottom:16px">
+          epoll 的 UAF，公开 PoC 成功率达到 <b>约 99%</b>，明确说影响 Android。
+          这是网上最诱人的一条。
+        </p>
+        <p style="font-size:14px;color:var(--dim2);margin-bottom:10px">判据一 —— 符号命名（6.6.144 有一系列重命名）：</p>
+        <pre>ep_remove             0xffffffc0804314f4   <span class="g">✅ 存在</span>
+ep_remove_epi         0xffffffc0804308fc   <span class="g">✅ 存在</span>
+ep_remove_safe        <span class="r">❌ 不存在</span>
+__ep_remove           <span class="r">❌ 不存在</span>
+<span class="c">⇒ 命名是「修复后」的形态</span>
+</pre>
+        <p style="font-size:14px;color:var(--dim2);margin-bottom:10px">判据二 —— 反汇编 <code>ep_remove</code>：</p>
+        <pre>0x431568  ldr   x20, [x21, #0x30]   <span class="c">; x20 = epi-&gt;ffd.file</span>
+0x43156c  ldr   x8,  [x20, #0x18]   <span class="c">; file-&gt;f_count</span>
+0x4315a0  <span class="g">ldxr  x10, [x11]</span>        <span class="c">; ★ atomic_long_inc_not_zero = get_file_rcu()</span>
+0x4315ac  <span class="g">stlxr w12, x9, [x11]</span>
+0x4315bc  <span class="g">cbz   x20, 0x4316d4</span>       <span class="c">; ★ pin 失败就跳过临界区</span>
+0x4315c8  bl    _raw_spin_lock
+0x4316d0  <span class="g">bl    fput</span>                <span class="c">; ★ 释放 pin</span>
+</pre>
+        <div class="verdict bad">
+          <span class="vi">✗</span>
+          <div><code>epi_fget</code> 内联 + 门控 + <code>fput</code> 配对 ——
+          <b>完全是修复后的形态</b>。99% 成功率的 PoC 在我们这里一次都不会成功。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="quote reveal">
+      <b>不要相信版本号，要相信反汇编。</b><br>
+      <span style="font-size:16px;color:var(--dim)">
+      连 <code>ghostlock419</code> 的 README 自己都写了「OEM 可能提前回补等效修正，不能只依版本字串判定」——
+      我们还是亲身体验了一次。
+      </span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="s7">
+  <div class="wrap">
+    <div class="snum reveal">07 — 门 A 为什么永不开</div>
+    <h2 class="reveal">你没法猜出一个签名</h2>
+    <p class="reveal">
+      门 A 的核心是：你得让 bootloader 相信这个内核是小米签的。
+      而校验用的是非对称签名 —— <b>验证只需要公钥（在设备里），签发需要私钥（只有小米有）</b>。
+      这不是「防护不够好」，这是数学。
+    </p>
+
+    <div class="forge reveal">
+      <div class="ct" style="font-family:var(--mono);font-size:12px;letter-spacing:.2em;color:var(--dim2);text-transform:uppercase;margin-bottom:6px">动手试一下</div>
+      <p style="margin:0 0 6px;font-size:15.5px">
+        假装你要为 <code>boot.img</code> 伪造一个 RSASSA-PKCS1-v1_5 / SHA-256 签名。
+        下面是需要命中的目标摘要：
+      </p>
+      <div class="fbar">
+        <div class="row"><span class="k">target[0:16]</span><span class="v" id="tg">9f2a 7c41 e08b 33d5 ...</span></div>
+        <div class="row"><span class="k">your[0:16]</span><span class="v" id="yg" style="color:var(--dead)">a17b 3e99 0c44 b2d1 ...</span></div>
+        <div class="row"><span class="k">剩下要试</span><span class="v" id="left">1.15 × 10<sup>77</sup></span></div>
+      </div>
+      <button id="forgeben">试一次</button>
+      <span class="tries" id="tries">已试 0 次</span>
+      <p style="margin:16px 0 0;font-size:13.5px;color:var(--dim2)">
+        假设你每秒能试 10<sup>9</sup> 次，试完需要约 3.7 × 10<sup>60</sup> 年。
+        宇宙年龄约 1.4 × 10<sup>10</sup> 年 —— <b style="color:var(--dead)">差 50 个数量级</b>。
+      </p>
+    </div>
+
+    <p class="reveal">
+      所以门 A 上的所有努力（刷机脚本、BROM 工具、LK 补丁、各种 MTK exploit）
+      <b>不是失败了，是不可能成功</b>。我们当时已经知道这一点，但仍在 A 上反复尝试 ——
+      因为 A 是「看起来最接近」的那条路。
+    </p>
+  </div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="s8">
+  <div class="wrap">
+    <div class="snum reveal">08 — 另一堵墙</div>
+    <h2 class="reveal">BROM：连「进到设备里」都要授权</h2>
+    <p class="reveal">
+      MTK 平台有一个底层模式（BootROM，BROM），本该是最后的救命通道 ——
+      它比 bootloader 更底层，很多工具靠它直接读写闪存。
+      <b>但小米同时开了两把锁。</b>
+    </p>
+
+    <div class="cmp reveal" style="border-color:rgba(248,81,73,.3)">
+      <div class="pane on" style="padding:22px 24px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+          <div style="border:1px solid var(--line2);border-radius:9px;padding:15px 17px">
+            <div style="font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--dead)">SLA</div>
+            <div style="font-weight:700;margin:4px 0 6px">Serial Link Authorization</div>
+            <div style="font-size:13.5px;color:var(--dim)">
+              上传 DA（Download Agent）需要签名挑战回应。
+              没有对应密钥就拿不到可用的 DA。
+            </div>
+          </div>
+          <div style="border:1px solid var(--line2);border-radius:9px;padding:15px 17px">
+            <div style="font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--dead)">DAA</div>
+            <div style="font-weight:700;margin:4px 0 6px">Download Agent Authentication</div>
+            <div style="font-size:13.5px;color:var(--dim)">
+              只能加载厂商自己的官方 DA。
+              自制/通用 DA 一律 <code>0x7017</code> / <code>0x7024</code>。
+            </div>
+          </div>
+        </div>
+        <div class="verdict bad" style="margin-top:18px">
+          <span class="vi">✗</span>
+          <div>权威文档 penumbra 的 FAQ 原话：<b>「尤其小米……这不是 bug」</b>。
+          商业工具有授权（Infinity-Box 甚至列了 <code>Redmi-Pad-SE-8-flare</code>），但那是付费门路。</div>
+        </div>
+      </div>
+    </div>
+
+    <h3 class="reveal">于是整条启动链工具线，全都绕回同一个死循环</h3>
+    <table class="reveal">
+      <thead><tr><th>工具 / 漏洞</th><th>它需要什么前提</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">fenrir</td><td>先解锁 seccfg 才能利用 bl2_ext 未验证</td><td><span class="pill dead">反过来依赖解锁</span></td></tr>
+        <tr><td class="mono">lkpatcher</td><td>需要 mtkclient（BROM）先解锁</td><td><span class="pill dead">绕回 BROM 死路</span></td></tr>
+        <tr><td class="mono">Kamakiri</td><td>BROM <code>wIndex</code> 越界</td><td><span class="pill dead">2023+ 芯片已加边界检查</span></td></tr>
+        <tr><td class="mono">Heapbait</td><td>DA2 堆溢出</td><td><span class="pill dead">2024-11 修复，固件 2026-07</span></td></tr>
+        <tr><td class="mono">Carbonara</td><td>需要<b>已签名</b>的 DA1</td><td><span class="pill dead">DA_HASH_MISMATCH</span></td></tr>
+      </tbody>
+    </table>
+
+    <div class="note reveal">
+      这五条我们全都认真研究过，其中 BROM 那条读了 penumbra 的全部文档。
+      <b>它们失败的方式完全一样：都需要一个我们拿不到的前置条件。</b>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="s9">
+  <div class="wrap">
+    <div class="snum reveal">09 — 真正的死结</div>
+    <h2 class="reveal">门 A 被数学锁死，门 B 被回补锁死</h2>
+
+    <div class="doors" style="grid-template-columns:1fr 1fr">
+      <div class="door a reveal">
+        <div class="dh"><span class="state">数学上不可能</span>
+          <h3 style="margin:0;font-size:18px">门 A</h3></div>
+        <div class="db"><div style="font-size:14.5px;color:var(--dim);line-height:1.65">
+          需要小米的 RSA 私钥，或付费的 BROM 授权。<br>
+          <b style="color:var(--dead)">不存在等待或努力能解决的路径。</b>
+        </div></div>
+      </div>
+      <div class="door b reveal">
+        <div class="dh"><span class="state">当时没找到</span>
+          <h3 style="margin:0;font-size:18px">门 B</h3></div>
+        <div class="db"><div style="font-size:14.5px;color:var(--dim);line-height:1.65">
+          270 个候选全部已回补。<br>
+          <b style="color:var(--prim)">但「没找到」≠「不存在」。</b>
+        </div></div>
+      </div>
+    </div>
+
+    <p class="reveal" style="margin-top:28px">
+      所以「一直失败」的全部技术原因可以压缩成一句话：
+      <b>当时我们手里没有任何一个可用的原语，而唯一可能产生原语的那条路，我们无法判断它是否已经走完。</b>
+    </p>
+
+    <h3 class="reveal">而第 38 轮发生了一件事</h3>
+    <p class="reveal">
+      在一次尝试中，设备 <b>kernel panic</b> 了。这看起来很糟，但它其实是整段研究里第一个好消息 ——
+      <b>panic 证明那个 UAF 是真实存在的</b>。之后我们陆续做到了：
+    </p>
+    <ul class="reveal">
+      <li>第 44 轮 —— KASLR 稳定（tracefs raw 记录法，5/5 正确）</li>
+      <li>第 47 轮 —— 任意写原语逐指令确认</li>
+      <li>第 57 轮 —— 写出极简第二实现 <code>pwn_min</code> 交叉验证</li>
+    </ul>
+
+    <div class="callout dead reveal">
+      <div class="ct">但这里卡了很久</div>
+      <p style="margin-bottom:10px">
+        <b>Stage A（打成 Permissive）能成功，Stage C（改 cred 拿 uid 0）一直失败。</b>
+      </p>
+      <pre style="margin-bottom:10px">喷射 234 MB → 直接 reap → <span class="r">50% 概率 panic</span></pre>
+      <p style="margin-bottom:0">
+        我们当时不知道「<b>必须先确认命中再 reap</b>」。有原语，但收不了尾 —— 而<b>没有任何东西能告诉我们
+        「收尾本该是什么样」</b>。这就是第二层原因的具体形态。
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="s10">
+  <div class="wrap">
+    <div class="snum reveal">10 — 转折</div>
+    <h2 class="reveal">Shark 带来的不是漏洞，是参照</h2>
+    <p class="reveal">
+      路径是这样的：先看到一个文档站，它链了一个 sister project，
+      在那个项目的设备表里我们看到了<b>一个和内核对逐字符相同的字符串</b>。
+    </p>
+
+    <div class="kmatch reveal">
+      <div style="font-family:var(--mono);font-size:12px;letter-spacing:.18em;color:var(--dim2);text-transform:uppercase;margin-bottom:14px">内核对齐</div>
+      <div class="kmrow"><div class="k">我们的设备</div><div class="v">Redmi Pad SE 8.7 · MT8786</div></div>
+      <div class="kmrow"><div class="k">我们的内核</div><div class="v">6.6.118-android15-8-gc4127a25dcf3-ab15863337-4k</div></div>
+      <div class="kmrow hit"><div class="k">Shark 支持列表</div><div class="v"><span class="hl">6.6.118-android15-8-gc4127a25dcf3-ab15863337-4k</span></div></div>
+      <div class="kmrow"><div class="k">对应的设备</div><div class="v">OnePlus Pad2 Pro (OPD2413) · OPPO Find N5 (PKH110) · OPPO Pad4 Pro (OPD2409)</div></div>
+    </div>
+
+    <div class="callout prim reveal">
+      <div class="ct">一个非常重要的认识</div>
+      <p style="margin-bottom:0">
+        <b>Shark 从来没有听说过 Redmi Pad SE 8.7。</b>它支持列表里全是 OnePlus / OPPO / Realme / vivo。
+        它仍然能用，因为 <b>exploit 绑定的是内核二进制，不是设备型号</b>。
+        我们的平板和 OPPO Pad4 Pro 共享同一颗内核构建 —— 那么能打穿 OPPO 的，就能打穿我们。
+      </p>
+    </div>
+
+    <h3 class="reveal">它实际给我们的是四样东西</h3>
+    <table class="reveal">
+      <thead><tr><th style="width:34%">给了什么</th><th>为什么关键</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>一个存在性证明</b></td>
+          <td>同一颗内核上，有人跑出过 <code>timers=512</code> 并且打到了 <code>uid=0</code>。
+          「设备不支持」这个假设被直接推翻。</td>
+        </tr>
+        <tr>
+          <td><b>一份可对照的行为基线</b></td>
+          <td>上游二进制打印 <code>timers=512</code>，我们自己编译的打印 <code>timers=0</code>。
+          <b>同一个设备、同一份源码，输出不同 ⇒ 差异只能在我的构建里。</b>
+          这一步把「玄学」变成了「可定位的 bug」。</td>
+        </tr>
+        <tr>
+          <td><b>一个工程完成的链条</b></td>
+          <td>从原语到 <code>ksud late-load</code> 的完整收尾顺序，
+          以及「第一次失败是正常的」这一条经验 —— 后者直接影响我们会不会在失败后继续。</td>
+        </tr>
+        <tr>
+          <td><b>指向正确的内核构建</b></td>
+          <td>这个 exploit 对地址布局极度敏感。
+          它支持 <code>6.6.118</code> 这条链，等于告诉我们哪些常量对我们有效。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="quote reveal">
+      所以「拿到 Shark 之前一直失败」的准确表述是：<br>
+      我们<b>已经有了漏洞</b>，但<b>缺少一个证明这条路能走完的存在性证据</b>。<br>
+      <span style="font-size:16px;color:var(--dim)">没有它，任何失败都可以被解释成「这条路本来就不通」。</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="s11">
+  <div class="wrap">
+    <div class="snum reveal">11 — 但是</div>
+    <h2 class="reveal">拿到 Shark 之后，还是失败了</h2>
+    <p class="reveal">
+      这一点很值得记住：<b>Shark 装上之后我们依然没成功</b>。App 一直打印 <code>[calib] timers=0</code>，
+      而设备上手动跑它的二进制是 <code>timers=512</code>。
+    </p>
+    <p class="reveal">
+      真正的原因和启动链、签名、SELinux 全都没关系 —— 是一个<b>21 位</b>的算术错误。
+    </p>
+
+    <h3 class="reveal">源码假设 KASLR 是 2 MiB 对齐的</h3>
+    <p class="reveal">
+      exploit 需要在内存里找内核对象，它靠「比对地址的低 21 位」来筛选。
+      源码假设 KASLR 偏移是 2 MiB（<code>0x200000</code>）的倍数 —— 那样低 21 位就永远不变。
+      <b>但这台设备的 KASLR 偏移不是。</b>
+    </p>
+
+    <div class="kslr reveal">
+      <div class="lbl">拖动滑块：KASLR 偏移的低 21 位</div>
+      <input type="range" id="ksr" min="0" max="3" step="1" value="1">
+      <div class="ticks"><span>0x00000</span><span>0x80000</span><span>0x100000</span><span>0x180000</span></div>
+
+      <div class="out">
+        <div class="box">
+          <div class="bl">源码期望的低 21 位</div>
+          <div class="bv">0x<span id="want">195d48</span></div>
+          <div class="bnote">do_timer_create+0xa8 的链接期常量</div>
+        </div>
+        <div class="box">
+          <div class="bl">内存里实际的低 21 位</div>
+          <div class="bv" id="got" style="color:var(--dead)">0x015d48</div>
+          <div class="bnote" id="gotnote">（链接值 + 偏移）mod 2<sup>21</sup></div>
+        </div>
+      </div>
+
+      <div class="verdict bad" id="kverdict" style="margin-top:18px">
+        <span class="vi">✗</span>
+        <div id="ktext">不相等 ⇒ 过滤器一个都匹配不到 ⇒ <code>timers=0</code> ⇒ 整个链条静默失效，不报错、不崩溃</div>
+      </div>
+      <p style="margin:16px 0 0;font-size:13.5px;color:var(--dim2)">
+        注意最坏的地方：<b>它不报错</b>。过滤器匹配不到只是返回 0，
+        程序继续往下走，最后打印一个看起来像「设备不支持」的日志。
+      </p>
+    </div>
+
+    <p class="reveal">
+      修法很小：<b>把四个候选各试一遍，取命中数最多的那个</b>。
+    </p>
+    <pre class="reveal"><span class="c">/* 四个候选各试一遍 */</span>
+static const unsigned long long cands[4] = {0, 0x80000, 0x100000, 0x180000};
+for (int ci = 0; ci &lt; 4; ci++) {
+    g_low_adj = cands[ci];
+    cc = scan_timer_allocs(...);
+    if (cc &gt; c) { c = cc; best_ci = ci; }
+}</pre>
+    <pre class="reveal"><span class="c">/* 修复之后 */</span>
+[calib] timers=<span class="g">512</span> low_adj=<span class="g">0x80000</span>
+[cred]  task=0xffffff807a40cb00 task_recs=<span class="g">1</span>   <span class="c">← 从 0 变 1</span>
+<span class="g">PROBE_OK</span></pre>
+
+    <div class="callout alive reveal">
+      <div class="ct">这就是那个参照物的价值</div>
+      <p style="margin-bottom:0">
+        如果没有 <code>timers=512</code> 这份基线，我们的 <code>timers=0</code> 会被解释成
+        「这颗内核对不上 / 设备不支持 / exploit 已失效」。
+        <b>有了它，唯一剩下的解释就是「我的代码写错了」</b> —— 于是我们才去比对那两个十六进制数。
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="s12">
+  <div class="wrap">
+    <div class="snum reveal">12 — 收尾</div>
+    <h2 class="reveal">三句话</h2>
+
+    <div class="quote reveal" style="border-left-color:var(--dead)">
+      <b>1 · 不要把时间花在密码学上。</b><br>
+      <span style="font-size:16px;color:var(--dim)">
+      门 A 的「不行」是永久的。尽早确认它，然后把全部精力放到门 B。
+      </span>
+    </div>
+
+    <div class="quote reveal" style="border-left-color:var(--unk)">
+      <b>2 · 不要相信版本号，要相信反汇编。</b><br>
+      <span style="font-size:16px;color:var(--dim)">
+      我们验证过的所有「按版本号应该有」的漏洞，全部已被提前回补。
+      判据要落在二进制上，而不是字符串上。
+      </span>
+    </div>
+
+    <div class="quote reveal" style="border-left-color:var(--prim)">
+      <b>3 · 找一个参照物，比再试十遍更有用。</b><br>
+      <span style="font-size:16px;color:var(--dim)">
+      这份研究里最有价值的一次突破，不是发现了新漏洞，而是找到了「同一颗内核上确实能成功」的证据。
+      它把「这条路不通」和「我的实现有 bug」彻底分开了。
+      </span>
+    </div>
+
+    <div class="callout reveal" style="margin-top:34px">
+      <div class="ct">最终结果</div>
+      <p style="margin-bottom:8px">
+        修好那 21 位之后，三段链条跑通，<b>bootloader 保持锁定、0 次分区写入</b>：
+      </p>
+      <pre style="margin-bottom:8px"><span class="c">$ adb shell su -c id</span>
+uid=0(root) gid=0(root) groups=0(root) context=<span class="g">u:r:ksu:s0</span>
+
+<span class="c">$ adb shell grep kernelsu /proc/modules</span>
+kernelsu 180224 4 - <span class="g">Live</span></pre>
+      <p style="margin-bottom:0;font-size:14px;color:var(--dim2)">
+        临时的 —— 重启就恢复。没有任何永久性改动。
+      </p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div style="margin-bottom:14px">
+      <b style="color:var(--fg)">相关</b> ·
+      <a href="https://github.com/nestchao/redmi-pad-se-87-root">完整仓库</a> ·
+      <a href="https://github.com/nestchao/redmi-pad-se-87-root/blob/main/docs/03-dead-ends.md">03 · 所有死路与证据</a> ·
+      <a href="https://github.com/nestchao/redmi-pad-se-87-root/blob/main/docs/13-timeline.md">13 · 研究时间线</a> ·
+      <a href="https://github.com/nestchao/redmi-pad-se-87-root/blob/main/docs/09-root-cause.md">09 · 根因分析</a>
+    </div>
+    <div style="font-size:13px;color:var(--dim2);line-height:1.75">
+      本文所有结论都来自我们自己的验证：反汇编、逐方法号探测、进程检查、ChangeLog 全量解析。<br>
+      数字与命令均可在仓库的 <code>docs/</code> 与 <code>tools/</code> 中复核。
+      仅用于自有设备的安全研究。
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------------- progress + toc ---------------- */
+  var bar = document.getElementById("bar");
+  var tocLinks = Array.prototype.slice.call(document.querySelectorAll("nav.toc a"));
+  var sections = tocLinks.map(function (a) {
+    return document.querySelector(a.getAttribute("href"));
+  });
+
+  function onScroll() {
+    var h = document.documentElement;
+    var p = h.scrollTop / (h.scrollHeight - h.clientHeight || 1);
+    bar.style.width = (p * 100) + "%";
+    var mid = window.scrollY + window.innerHeight * 0.4;
+    var idx = 0;
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i] && sections[i].offsetTop <= mid) idx = i;
+    }
+    tocLinks.forEach(function (a, i) { a.classList.toggle("on", i === idx); });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* ---------------- reveal on scroll ---------------- */
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        e.target.classList.add("in");
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.06, rootMargin: "0px 0px -40px 0px" });
+  document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+
+  /* ---------------- trust chain ---------------- */
+  var STAGES = [
+    {
+      t: "BootROM", s: "片内固化的第一段代码",
+      v: ["dead", "无法修改"],
+      d: "芯片出厂时烧死的只读代码。它决定从哪读下一级、要不要校验。修改它需要新芯片 —— 不在讨论范围内。"
+    },
+    {
+      t: "Preloader / SPL", s: "厂商引导的第一级",
+      v: ["dead", "SLA + DAA"],
+      d: "由 BROM 加载并校验。想改它得先能写闪存，而写闪存需要 BROM 授权（SLA），加载的 DA 又要过 DAA。两把锁。"
+    },
+    {
+      t: "LK · little kernel", s: "fastboot 所在的 bootloader",
+      v: ["dead", "seccfg 锁定"],
+      d: "fastboot 拒绝刷写：<code>FAILED (remote: 'not allowed in locked state')</code>。解锁 seccfg 本身也需要能写闪存 —— 死循环。"
+    },
+    {
+      t: "boot.img 校验 · AVB2.0", s: "★ 整条链的关键闸门",
+      v: ["dead", "RSA-2048 签名"],
+      d: "对 vbmeta / boot / dtbo 做完整性与真实性校验。公钥在设备里，私钥只有厂商有。<b>这里不是「难」，是数学上不可能伪造。</b>"
+    },
+    {
+      t: "Linux kernel 启动", s: "校验结束，系统开始相信自己",
+      v: ["prim", "边界在这里"],
+      d: "<b>关键：AVB 通过之后，内核运行期间再也不校验自己的代码段或自己的 cred。</b>所以任何「在内核运行之后」发生的写入，都不会触发签名检查 —— 这就是门 B 的入口。"
+    },
+    {
+      t: "init / 属性 / SELinux", s: "用户态第一个进程",
+      v: ["dead", "Enforcing"],
+      d: "SELinux 强制模式。shell 域不能写 system 分区、不能 ptrace init、不能加载模块。"
+    },
+    {
+      t: "zygote → App 进程", s: "普通应用与 adb shell 所在层",
+      v: ["dead", "无特权接口"],
+      d: "厂商服务都在这层之上，且有白名单 / 签名校验 / 运行身份限制。我们探测过的 mqsas 就是典型（见下）。"
+    }
+  ];
+
+  var chainEl = document.getElementById("chain");
+  STAGES.forEach(function (st, i) {
+    var row = document.createElement("div");
+    row.className = "cstage";
+    row.innerHTML =
+      '<div class="idx">' + String(i + 1).padStart(2, "0") + '</div>' +
+      '<div class="nm"><div class="t">' + st.t + '</div><div class="s">' + st.s + '</div></div>' +
+      '<div class="vd"><span class="pill ' + st.v[0] + '">' + st.v[1] + '</span></div>';
+    var det = document.createElement("div");
+    det.className = "cdetail";
+    det.innerHTML = '<div class="inner">' + st.d + '</div>';
+    row.addEventListener("click", function () {
+      var open = det.classList.contains("show");
+      chainEl.querySelectorAll(".cdetail.show").forEach(function (d) { d.classList.remove("show"); });
+      chainEl.querySelectorAll(".cstage.open").forEach(function (c) { c.classList.remove("open"); });
+      if (!open) {
+        det.classList.add("show");
+        row.classList.add("open");
+      }
+    });
+    chainEl.appendChild(row);
+    chainEl.appendChild(det);
+  });
+
+  /* ---------------- funnel ---------------- */
+  var funnelIO = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      e.target.querySelectorAll(".fb i").forEach(function (b, i) {
+        setTimeout(function () { b.style.width = b.dataset.w; }, i * 130);
+      });
+      funnelIO.unobserve(e.target);
+    });
+  }, { threshold: 0.3 });
+  funnelIO.observe(document.getElementById("funnel"));
+
+  /* ---------------- dead-end cards ---------------- */
+  var DEAD = [
+    {
+      cat: "kernel", title: "CVE-2026-43499 · GhostLock", v: ["dead", "已修补"],
+      claim: "2026 年最热的安卓临时 root 漏洞，有 4 个公开实现（Pixel / 三星 / 高通 / 一加）。官方修复在 6.6.140，我们 6.6.118 —— 按版本号该有。",
+      kill: "反汇编 <code>remove_waiter</code>：函数跨度 0x278 内 <b>0 次</b> <code>mrs sp_el0</code>。ARM64 上取 <code>current</code> 只有这一条路 ⇒ 它根本不读 current ⇒ <b>已 backport</b>。清 <code>pi_blocked_on</code> 用的是 <code>[x23,#0x50]</code>（结构体），不是 current。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-46242 · Bad Epoll", v: ["dead", "已修补"],
+      claim: "epoll UAF，公开 PoC 成功率约 99%，明确说影响 Android。网上最诱人的一条。",
+      kill: "符号是修复后的命名形态（<code>ep_remove</code> / <code>ep_remove_epi</code> 存在，<code>__ep_remove</code> / <code>ep_remove_safe</code> 不存在）；反汇编里 <code>ldxr/stlxr</code> = <code>get_file_rcu()</code> pin + <code>cbz</code> 门控 + <code>fput</code> 配对 ⇒ <b>完全修复形态</b>。"
+    },
+    {
+      cat: "kernel", title: "DirtyFrag / Dirty Pipe", v: ["dead", "已修补"],
+      claim: "临时 root 指南最常推荐的两条 page cache 写。",
+      kill: "CVE-2022-0847 早已修复；CVE-2026-43284（DirtyFrag，IPsec ESP 路径）也已修复。"
+    },
+    {
+      cat: "kernel", title: "CVE-2024-31317 · Zygote 注入", v: ["dead", "补丁版本不符"],
+      claim: "Zygote 注入，历史上有名的临时 root 手法。",
+      kill: "只对 SPL ≤ <code>2024-06-01</code> 有效，我们的 SPL 是 <b>2026-09-01</b>。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-49881 · TLPE", v: ["dead", "补丁版本不符"],
+      claim: "Android 17 Telecom → system_server 提权。",
+      kill: "修于 <b>SPL 2026-09-01</b> —— 而我们的 SPL 正好就是这一天。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-2091 · io_uring TOCTOU", v: ["dead", "已修补"],
+      claim: "io_uring fixed-file-table 竞态。",
+      kill: "修于 6.6.28，我们 6.6.118。且 Enforcing 下 <code>io_uring</code> 本身不可用。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-53365 · VsockDrop", v: ["dead", "入口不可达"],
+      claim: "vsock 路径的 UAF。",
+      kill: "需要 <code>AF_VSOCK</code> socket，Enforcing 下返回 <b>EACCES</b> —— 连入口都碰不到。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-43494 · PinTheft", v: ["dead", "入口不可达"],
+      claim: "RDS 路径的引用计数漏洞。",
+      kill: "需要 <code>AF_RDS</code> socket，Enforcing 下同样 <b>EACCES</b>。"
+    },
+    {
+      cat: "kernel", title: "CVE-2026-31413 · BPF verifier", v: ["dead", "版本不符"],
+      claim: "BPF 校验器缺陷。",
+      kill: "影响 6.1 LTS 分支，我们是 6.6；且 Enforcing 下 <code>bpf</code> 不可用。"
+    },
+    {
+      cat: "boot", title: "BROM · mtkclient · penumbra", v: ["dead", "SLA + DAA"],
+      claim: "MTK 最底层的救命通道，很多机型靠它直接读写闪存。",
+      kill: "penumbra 权威文档 FAQ：需要付费授权，<b>「尤其小米……这不是 bug」</b>。同时开 SLA（DA 需签名挑战回应）和 DAA（只能加载官方签名 DA）。"
+    },
+    {
+      cat: "boot", title: "fenrir", v: ["dead", "依赖解锁"],
+      claim: "bl2_ext 未验证 → EL3 代码执行。",
+      kill: "README 明说<b>需要 bootloader 已解锁</b>（seccfg）。而且仓库已归档废弃。"
+    },
+    {
+      cat: "boot", title: "lkpatcher", v: ["dead", "依赖 BROM"],
+      claim: "patch LK + 证书绕过。",
+      kill: "需要先用 mtkclient（BROM）解锁 seccfg ⇒ 绕回 BROM 死路。另外补丁全是 <b>32 位 Thumb</b> 指令，我们是 <b>arm64 LK</b>，未必对得上。"
+    },
+    {
+      cat: "boot", title: "Kamakiri", v: ["dead", "已修补"],
+      claim: "BROM <code>if_info[wIndex]</code> 无边界检查。",
+      kill: "修复加了 <code>wIndex</code> 边界检查；<b>2023+ 芯片几乎肯定已修</b>。"
+    },
+    {
+      cat: "boot", title: "Heapbait", v: ["dead", "已修补"],
+      claim: "DA2 <code>fp_read_host_file</code> 堆溢出。",
+      kill: "2024-11 前后修复；我们固件是 <b>2026-07</b> ⇒ 已修。"
+    },
+    {
+      cat: "boot", title: "Carbonara", v: ["dead", "需要签名 DA1"],
+      claim: "DA1 <code>boot_to</code> 可写任意地址，覆盖 DA2 hash。理论上是 BROM 线里唯一还有可能的。",
+      kill: "需要<b>已签名</b>的 DA1，否则 <code>0xc0070004 DA_HASH_MISMATCH</code>。而小米的 DA 是加密/需授权的。"
+    },
+    {
+      cat: "vendor", title: "mqsas · 小米诊断服务", v: ["dead", "三重封堵"],
+      claim: "六条独立来源都说 <code>IMQSNative</code> 的方法 21 能以 uid=0 执行任意脚本。这条我们花了最久。",
+      kill: "<b>封堵一</b>：逐号探测 1–30，方法 16–30 全部 <code>EBADMSG</code> —— 这个 ROM 只有 15 个方法，要用的是第 21 个。<br><b>封堵二</b>：真正的 <code>runCommand</code> 是方法 4，有白名单 —— shell 调用返回 <code>Command not allowed for shell user</code>，连 uid=0 调用也返回 <code>Command not allowed</code>。<br><b>封堵三</b>：后端 <code>mqsasd</code> 守护进程<b>根本没在跑</b>（<code>ps -A</code> 为空）。<br>附：服务运行身份是 <code>system</code> (uid 1000)，就算通了也<b>不是 root</b>。"
+    },
+    {
+      cat: "vendor", title: "CVE-2025-21479 · Adreno micronode", v: ["dead", "硬件不符"],
+      claim: "高通 GPU 驱动漏洞。",
+      kill: "我们是 <b>Mali</b> GPU（MTK），高通 Adreno 完全无关。"
+    },
+    {
+      cat: "vendor", title: "CVE-2026-21385 · Qualcomm Display", v: ["dead", "硬件不符"],
+      claim: "高通显示子系统漏洞。",
+      kill: "同上，硬件不是高通。"
+    },
+    {
+      cat: "unrelated", title: "CVE-2026-123007 / 123633 / 123634 / 121810 / 113425", v: ["dead", "完全无关"],
+      claim: "有人把这 5 个编号当成安卓提权漏洞给到我们。",
+      kill: "全部是 <b>nginx / NGINX Plus 的 Web 服务器 RCE</b>。和安卓内核提权毫无关系。"
+    },
+    {
+      cat: "unrelated", title: "NFC 系列 · 11 条 CVE", v: ["dead", "无硬件"],
+      claim: "NFC 协议栈历史上出过不少提权漏洞。",
+      kill: "设备<b>没有 NFC 硬件</b>（无 <code>/dev/nfc*</code>），11 条全部无效。"
+    },
+    {
+      cat: "open", title: "binder 的两个 UAF（6.6.145 修）", v: ["unk", "未继续"],
+      claim: "修复在 6.6.145、我们 6.6.118；二进制显示<b>未修补</b>；入口 <code>/dev/binderfs/binder</code> 权限 <code>0666</code>，碰得到。",
+      kill: "<code>binder_free_transaction</code> 里确实没有 <code>put_task_struct</code>，<code>__wake_up(&amp;to_proc+0x78)</code> 是可控的任意地址解引用。是<b>竞争型</b>漏洞，工程量大（要写 binder 协议 + 设计回收 + 堆喷）。<b>这条我们没做完，如果你要试，从它开始</b> —— <code>binder_proc</code> 落在 kmalloc-1k，比「一页」好回收得多。"
+    },
+    {
+      cat: "open", title: "CVE-2026-93189 · Joyride（hidraw）", v: ["unk", "未深入"],
+      claim: "<code>hid_hw_stop()</code> 不等 input 停止 ⇒ <code>hidraw</code> 释放后仍被写。入口 <code>/dev/uhid</code>，我们的 shell 有 <b>3011(uhid)</b> 组。",
+      kill: "只确认了 <code>hid_hw_stop</code> 前 0x120 字节里没有 <code>flush_work</code> / <code>cancel_work_sync</code> / <code>synchronize_rcu</code>，<b>没有深入分析</b>。这条也还没排除。"
+    },
+    {
+      cat: "open", title: "Magica · seccomp 被关时提权", v: ["unk", "理论可行"],
+      claim: "vvb2060/Magica：Android 10–16 在 seccomp 被关时可通过 app zygote 提权。Android 17 才用 SafeSetID LSM 补上，我们是 Android 16 —— 理论上有效。",
+      kill: "需要 app zygote 在 <b>permissive 状态</b>下被 fork，而 permissive 窗口很短。我们当时选了更直接的 Shark 路线，<b>没有实测</b>。机制已从 AOSP 源码确认：<code>if (!gIsSecurityEnforced) return;</code> 就不装 setuid 过滤器。"
+    }
+  ];
+
+  var CATNAME = { kernel: "内核 CVE", boot: "启动链", vendor: "厂商服务", unrelated: "无关", open: "未排除" };
+  var cardsEl = document.getElementById("cards");
+
+  DEAD.forEach(function (c) {
+    var el = document.createElement("div");
+    el.className = "card";
+    el.dataset.cat = c.cat;
+    el.innerHTML =
+      '<div class="ch"><div class="ctitle">' + c.title + '</div>' +
+      '<div class="cbadge"><span class="pill ' + c.v[0] + '">' + c.v[1] + '</span></div></div>' +
+      '<div class="claim">' + c.claim + '</div>' +
+      '<div class="kill">' + c.kill + '</div>' +
+      '<div class="more">点开看判据 ▾</div>';
+    var kill = el.querySelector(".kill");
+    el.addEventListener("click", function () {
+      var open = kill.classList.toggle("show");
+      el.querySelector(".more").textContent = open ? "收起 ▴" : "点开看判据 ▾";
+    });
+    cardsEl.appendChild(el);
+  });
+
+  document.getElementById("filters").addEventListener("click", function (e) {
+    var btn = e.target.closest("button");
+    if (!btn) return;
+    this.querySelectorAll("button").forEach(function (b) { b.classList.remove("on"); });
+    btn.classList.add("on");
+    var f = btn.dataset.f;
+    cardsEl.querySelectorAll(".card").forEach(function (c) {
+      c.classList.toggle("hide", f !== "all" && c.dataset.cat !== f);
+    });
+  });
+
+  /* ---------------- compare tabs ---------------- */
+  document.getElementById("cmp").addEventListener("click", function (e) {
+    var btn = e.target.closest(".tabs button");
+    if (!btn) return;
+    var i = btn.dataset.p;
+    this.querySelectorAll(".tabs button").forEach(function (b) { b.classList.toggle("on", b === btn); });
+    this.querySelectorAll(".pane").forEach(function (p) {
+      p.classList.toggle("on", p.dataset.pane === i);
+    });
+  });
+
+  /* ---------------- forge demo ---------------- */
+  var HEX = "0123456789abcdef";
+  var triesEl = document.getElementById("tries");
+  var leftEl = document.getElementById("left");
+  var ygEl = document.getElementById("yg");
+  var tries = 0;
+
+  function randHex(n) {
+    var s = "";
+    for (var i = 0; i < n; i++) {
+      s += HEX[Math.floor(Math.random() * 16)];
+      if (i % 4 === 3 && i !== n - 1) s += " ";
+    }
+    return s;
+  }
+
+  function fmtLeft(n) {
+    if (n <= 0) return "0";
+    var exp = Math.floor(Math.log10(n));
+    var mant = n / Math.pow(10, exp);
+    return mant.toFixed(2) + " × 10<sup>" + exp + "</sup>";
+  }
+
+  document.getElementById("forgeben").addEventListener("click", function () {
+    tries++;
+    ygEl.textContent = randHex(16) + " ...";
+    triesEl.textContent = "已试 " + tries.toLocaleString() + " 次";
+    leftEl.innerHTML = fmtLeft(1.1579e77 - tries);
+    if (tries > 20) {
+      triesEl.textContent = "已试 " + tries.toLocaleString() + " 次 · 别试了";
+    }
+  });
+
+  /* ---------------- KASLR slider ---------------- */
+  var SLIDES = [0x0, 0x80000, 0x100000, 0x180000];
+  var LINK = 0x195d48;
+  var MOD = 0x200000;
+
+  var ksr = document.getElementById("ksr");
+  var wantEl = document.getElementById("want");
+  var gotEl = document.getElementById("got");
+  var noteEl = document.getElementById("gotnote");
+  var kvEl = document.getElementById("kverdict");
+  var ktEl = document.getElementById("ktext");
+
+  function hex6(v) {
+    var s = v.toString(16);
+    while (s.length < 6) s = "0" + s;
+    return s;
+  }
+
+  function updateK() {
+    var slide = SLIDES[parseInt(ksr.value, 10)];
+    var got = (LINK + slide) % MOD;
+    wantEl.textContent = hex6(LINK);
+    gotEl.textContent = "0x" + hex6(got);
+
+    var match = got === LINK;
+    if (slide === 0) {
+      noteEl.innerHTML = "偏移为 0 —— 低 21 位没变";
+    } else {
+      noteEl.innerHTML = "(0x" + hex6(LINK) + " + 0x" + hex6(slide) + ") mod 2<sup>21</sup>";
+    }
+
+    kvEl.className = "verdict " + (match ? "good" : "bad");
+    kvEl.querySelector(".vi").textContent = match ? "✓" : "✗";
+    gotEl.style.color = match ? "var(--alive)" : "var(--dead)";
+
+    if (match) {
+      ktEl.innerHTML = "相等 ⇒ 过滤器命中 ⇒ <code>timers=512</code> ⇒ 链条继续。"
+        + "<b>四选一的自校准只需要找到这个偏移。</b>";
+    } else {
+      var diff = (got - LINK + MOD) % MOD;
+      ktEl.innerHTML = "两个低 21 位差 <code>0x" + hex6(diff) + "</code> ⇒ "
+        + "过滤器一个都匹配不到 ⇒ <code>timers=0</code> ⇒ 整条链<b>静默失效</b>：不报错、不崩溃。";
+    }
+  }
+  ksr.addEventListener("input", updateK);
+  updateK();
+})();
+</script>
+</body>
+</html>
