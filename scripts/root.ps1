@@ -431,6 +431,10 @@ if (-not $succeeded) {
 
 Ok "root acquired on attempt $i"
 
+# Let ksud finish writing /system/bin/su before the verify reads below run;
+# querying during that write returns "Text file busy".
+Start-Sleep -Seconds 2
+
 # ---------------------------------------------------------------------------
 # 5. verify
 # ---------------------------------------------------------------------------
