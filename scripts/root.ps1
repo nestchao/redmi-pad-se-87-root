@@ -66,6 +66,7 @@ param(
     [int]$AttemptTimeoutSec = 120,
     [switch]$ProbeOnly,
     [switch]$Force,
+    [switch]$RebootRetry,
     [switch]$SkipPush
 )
 
@@ -229,8 +230,9 @@ else { Bad 'shell is not in readtracefs - the probe cannot read the trace buffer
 $selinux = Sh $adb $serial 'getenforce'
 Info "getenforce = $selinux"
 
-# already rooted?
-$pre = Sh $adb $serial 'su -c id'
+# already rooted? (on a fresh device su doesn't exist yet - that's the normal start)
+$pre = $null
+try { $pre = Sh $adb $serial 'su -c id' } catch { $pre = $_.Exception.Message }
 $already = $pre -match 'uid=0\(root\)'
 if ($already -and -not $Force) {
     Head 'already rooted'
@@ -368,9 +370,68 @@ function Get-ExploitPid {
     return $null
 }
 
+function Get-LastRunSummary {
+    # Summarise the newest run log, so a leftover holder explains itself instead
+    # of looking like a mystery.
+    $log = Sh $adb $serial "ls -t $TMP/shark_run*.log 2>/dev/null | head -1"
+    if (-not $log) { return @() }
+    $t = Sh $adb $serial "grep -E 'FAIL=|LATE_LOAD_RC=|burst hit=0' '$log' 2>/dev/null | tail -2"
+    if (-not $t) { return @() }
+    return @($t -split "`n" | Where-Object { $_ })
+}
+
 $succeeded = $false
 $attemptsMade = 0
 $stoppedOnHolder = $false
+
+# A run leaves the exploit parked and alive whether it succeeded or failed.  A
+# successful one would make `su` work, and we already exited above in that case,
+# so an instance alive here means the last run FAILED and is still holding pages.
+$busy = Get-ExploitPid
+if ($busy) {
+    Head 'leftover from a previous run'
+    Warn "exploit instance pid $busy is still alive"
+    $last = Get-LastRunSummary
+    if ($last.Count) {
+        Info 'the last run ended with:'
+        foreach ($l in $last) { Info "    $l" }
+        Say ''
+        Info 'burst hit=0 means that stage missed its page reclaim. That is the'
+        Info 'documented 1-in-3 outcome, not a broken install or lost data.'
+    }
+    Say ''
+    Say '  A failed stage parks exactly the same holder a successful run leaves' 'DarkGray'
+    Say '  behind. Only a reboot releases it, and running a second instance over' 'DarkGray'
+    Say '  the same pages has rebooted this kernel during testing.' 'DarkGray'
+
+    if ($RebootRetry) {
+        Say ''
+        Info 'rebooting to release the holder, then retrying...'
+        & $adb -s $serial reboot 2>&1 | Out-Null
+        Start-Sleep -Seconds 12
+        & $adb -s $serial wait-for-device 2>&1 | Out-Null
+        $ready = $false
+        for ($k = 0; $k -lt 80; $k++) {
+            Start-Sleep -Seconds 3
+            if ((Sh $adb $serial 'getprop sys.boot_completed') -eq '1') { $ready = $true; break }
+        }
+        if (-not $ready) { Bad 'the device did not come back after the reboot'; exit 3 }
+        Ok 'device is back up'
+        Start-Sleep -Seconds 5
+        $busy = Get-ExploitPid
+        if ($busy) { Bad "an instance is still running after the reboot (pid $busy)"; exit 3 }
+        Ok 'holder released - starting a clean run'
+    }
+    else {
+        Say ''
+        Say '  Reboot and retry in one step with:' 'DarkGray'
+        Say "    .\$Self -RebootRetry" 'DarkGray'
+        Say ''
+        Say '  Never kill the holder by hand - it holds a fake cred page.' 'DarkGray'
+        exit 3
+    }
+}
+
 for ($i = 1; $i -le $MaxAttempts; $i++) {
     $attemptsMade = $i
     Say ''
@@ -465,8 +526,8 @@ if (-not $succeeded) {
         Say '  stage parks the same holder a successful one leaves behind. Running again' 'DarkGray'
         Say '  on top of it puts two instances over the same pages, so this script stops.' 'DarkGray'
         Say ''
-        Say '  Reboot to clear the holder, then run it again:' 'DarkGray'
-        Say "    adb reboot;  .\$Self" 'DarkGray'
+        Say '  Reboot and retry in one step:' 'DarkGray'
+        Say "    .\$Self -RebootRetry" 'DarkGray'
     }
     else {
         Bad "no root after $attemptsMade attempt(s)"
@@ -478,7 +539,7 @@ if (-not $succeeded) {
     Say ''
     Say '  Never kill a parked holder by hand - it holds a fake cred page and' 'DarkGray'
     Say '  killing it can panic the kernel.' 'DarkGray'
-    exit 1
+    if ($stoppedOnHolder) { exit 3 } else { exit 1 }
 }
 
 Ok "root acquired on attempt $i"
