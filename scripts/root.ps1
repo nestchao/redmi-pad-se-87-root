@@ -432,6 +432,32 @@ if ($busy) {
     }
 }
 
+# Give the reclaim race better odds before starting: put free memory back in
+# the allocator so fewer competing allocations land on the page we are trying
+# to win, and enlarge the trace ring buffer so our records are not overwritten
+# before they are read. Neither is required, both are cheap.
+Say ''
+Info 'preparing the machine'
+$mem = @()
+foreach ($step in @('before', 'after')) {
+    $v = Sh $adb $serial "awk '/^MemFree/{print `$2}' /proc/meminfo"
+    $mem += $(if ($v) { [int]$v } else { 0 })
+    if ($step -eq 'before') {
+        Sh $adb $serial 'am kill-all' | Out-Null
+        Start-Sleep -Seconds 3
+    }
+}
+$bufBefore = Sh $adb $serial 'cat /sys/kernel/tracing/buffer_size_kb 2>/dev/null'
+Sh $adb $serial 'echo 4096 > /sys/kernel/tracing/buffer_size_kb 2>/dev/null' | Out-Null
+$bufAfter = Sh $adb $serial 'cat /sys/kernel/tracing/buffer_size_kb 2>/dev/null'
+Info ("  free memory : {0:N0} kB -> {1:N0} kB" -f $mem[0], $mem[1])
+if ($bufBefore -and $bufAfter -and $bufBefore -ne $bufAfter) {
+    Info ("  trace buffer: {0} kB -> {1} kB" -f $bufBefore, $bufAfter)
+}
+elseif ($bufAfter) {
+    Info ("  trace buffer: {0} kB (already large)" -f $bufAfter)
+}
+
 for ($i = 1; $i -le $MaxAttempts; $i++) {
     $attemptsMade = $i
     Say ''
