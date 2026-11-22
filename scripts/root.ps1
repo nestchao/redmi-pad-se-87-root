@@ -88,6 +88,9 @@ $TMP = '/data/local/tmp'
 # This script is meant to be copyable, so look in a few layouts rather than
 # hard-coding one: next to the script, one level up, the published repo, and a
 # build32 subdirectory of any of those.
+# The script may have been copied and renamed; use its own name in messages.
+$Self = if ($PSCommandPath) { Split-Path $PSCommandPath -Leaf } else { 'root.ps1' }
+
 $ArtifactsBases = @(
     $ArtifactsDir,
     (Join-Path $PSScriptRoot 'artifacts'),
@@ -463,13 +466,13 @@ if (-not $succeeded) {
         Say '  on top of it puts two instances over the same pages, so this script stops.' 'DarkGray'
         Say ''
         Say '  Reboot to clear the holder, then run it again:' 'DarkGray'
-        Say '    adb reboot;  .\scripts\root.ps1' 'DarkGray'
+        Say "    adb reboot;  .\$Self" 'DarkGray'
     }
     else {
         Bad "no root after $attemptsMade attempt(s)"
         Say ''
         Say '  Every attempt exited cleanly, so retrying is safe:' 'DarkGray'
-        Say '    .\scripts\root.ps1 -MaxAttempts 8' 'DarkGray'
+        Say "    .\$Self -MaxAttempts 8" 'DarkGray'
     }
 
     Say ''
