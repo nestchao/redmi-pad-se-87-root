@@ -55,6 +55,10 @@
 param(
     [string]$Device,
     [string]$Binary = 'shark-k66118-32cand',
+    [string]$Ksud = 'ksud-3.3.1',
+
+    # Directory holding the binaries. Defaults to a search of the usual layouts.
+    [string]$ArtifactsDir,
     [int]$MaxAttempts = 4,
 
     # Seconds to wait for root after each launch. The exploit parks a holder
@@ -78,9 +82,45 @@ $MANAGER = 'me.weishu.kernelsu'
 $KMI = 'android15-6.6'
 $TMP = '/data/local/tmp'
 
-$Artifacts = Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts'
-$LocalBin = Join-Path $Artifacts $Binary
-$LocalKsud = Join-Path $Artifacts 'ksud-3.3.1'
+# ---------------------------------------------------------------------------
+# locate the binaries
+# ---------------------------------------------------------------------------
+# This script is meant to be copyable, so look in a few layouts rather than
+# hard-coding one: next to the script, one level up, the published repo, and a
+# build32 subdirectory of any of those.
+$ArtifactsBases = @(
+    $ArtifactsDir,
+    (Join-Path $PSScriptRoot 'artifacts'),
+    (Join-Path (Split-Path $PSScriptRoot -Parent) 'artifacts'),
+    (Join-Path (Split-Path $PSScriptRoot -Parent) 'redmi-pad-se-87-root\artifacts')
+) | Where-Object { $_ -and (Test-Path $_) }
+
+# Each base is followed immediately by its build32 subdirectory, so a local
+# build32 beats a parent directory that happens to hold the same binary.
+$ArtifactsDirs = @(foreach ($b in @($ArtifactsBases)) {
+    $b
+    $sub = Join-Path $b 'build32'
+    if (Test-Path $sub) { $sub }
+})
+
+function Find-Artifact([string[]]$names) {
+    # Nearest directory first, then fall back to the published repo layout, so a
+    # copy sitting next to its own binaries uses those rather than the repo's.
+    foreach ($n in $names) {
+        if ($n -and [System.IO.Path]::IsPathRooted($n) -and (Test-Path $n)) { return (Resolve-Path $n).Path }
+    }
+    foreach ($d in $ArtifactsDirs) {
+        foreach ($n in $names) {
+            if (-not $n) { continue }
+            $p = Join-Path $d $n
+            if (Test-Path $p) { return $p }
+        }
+    }
+    return $null
+}
+
+$LocalBin = Find-Artifact @($Binary, 'shark-k66118-32cand', 'shark-k66118-32', 'shark-k66118-fixed')
+$LocalKsud = Find-Artifact @($Ksud, 'ksud-3.3.1', 'ksud33', 'ksud')
 
 # ---------------------------------------------------------------------------
 # tiny helpers
@@ -140,9 +180,18 @@ Say '  CVE-2026-98260 · Redmi Pad SE 8.7 · temporary root' 'White'
 Say '  zero partition writes · bootloader stays locked · reboot undoes everything' 'DarkGray'
 
 Head 'locating files'
+if (-not $LocalBin) {
+    Bad "exploit binary not found (looked for: $Binary, shark-k66118-32)"
+    Info "searched: $($ArtifactsDirs -join '; ')"
+    exit 2
+}
+if (-not $LocalKsud) {
+    Bad 'ksud not found (looked for: ksud-3.3.1)'
+    Info "searched: $($ArtifactsDirs -join '; ')"
+    exit 2
+}
 foreach ($f in @($LocalBin, $LocalKsud)) {
-    if (-not (Test-Path $f)) { Bad "missing artifact: $f"; exit 2 }
-    Info ("{0}  ({1:N0} KB)" -f (Split-Path $f -Leaf), ((Get-Item $f).Length / 1KB))
+    Info ("{0}  ({1:N1} MB)  {2}" -f (Split-Path $f -Leaf), ((Get-Item $f).Length / 1MB), (Split-Path $f -Parent))
 }
 
 $adb = Find-Adb
