@@ -11,8 +11,9 @@
       2. push       - re-push the exploit only if /data/local/tmp lost it or it
                       differs from the artifact (Android cleans that directory)
       3. probe      - zero-risk self-test; the UAF is NOT triggered here
-      4. exploit    - `--auto`, retried, because the last stage is a probabilistic
-                      page reclaim (about 2 out of 3 runs succeed per the notes)
+      4. exploit    - `--auto` launched detached and polled, retried, because the
+                      last stage is a probabilistic page reclaim. The process parks a
+                      holder and never exits, so it must not be waited on.
       5. verify     - the five checks from docs/11-reproduce.md
 
     What it never does:
@@ -55,6 +56,10 @@ param(
     [string]$Device,
     [string]$Binary = 'shark-k66118-32cand',
     [int]$MaxAttempts = 4,
+
+    # Seconds to wait for root after each launch. The exploit parks a holder
+    # process instead of exiting, so we poll rather than wait for the command.
+    [int]$AttemptTimeoutSec = 120,
     [switch]$ProbeOnly,
     [switch]$Force,
     [switch]$SkipPush
@@ -300,47 +305,127 @@ if ($ProbeOnly) {
 Head 'exploit --auto'
 
 $envPrefix = "PYB110_KSUD=$REMOTE_KSUD PYB110_MANAGER_PKG=$MANAGER PYB110_KMI=$KMI"
-$runCmd = "cd $TMP && $envPrefix $REMOTE_BIN --auto"
+
+# A run either succeeds (and stays alive holding the faked cred page) or fails
+# (and parks the same way).  Either way an instance may still be running, and
+# starting a second one while the first still holds pages is how you get a
+# kernel that reboots under you.  So: never overlap.
+function Get-ExploitPid {
+    $p = Sh $adb $serial "pidof $(Split-Path $REMOTE_BIN -Leaf) 2>/dev/null"
+    if ($p -match '^\d+') { return $p.Trim() }
+    return $null
+}
 
 $succeeded = $false
+$attemptsMade = 0
+$stoppedOnHolder = $false
 for ($i = 1; $i -le $MaxAttempts; $i++) {
+    $attemptsMade = $i
     Say ''
     Say ("  attempt $i / $MaxAttempts") 'White'
 
-    $out = Sh $adb $serial $runCmd
+    $busy = Get-ExploitPid
+    if ($busy) {
+        Warn "an exploit instance is still running (pid $busy) - not starting another one"
+        Info 'that is the normal end state after a run, whether it succeeded or not.'
+        Info 'reboot to clear it:   adb reboot'
+        $stoppedOnHolder = $true
+        break
+    }
 
+    $runLog = "$TMP/shark_run_$i.log"
+
+    # Two details make the launch actually return:
+    #   * separate the commands with ';' -- chaining them with '&&' and then '&'
+    #     backgrounds the whole and-or list, and that wrapping subshell keeps the
+    #     pty's stdout open, so `adb shell` never sees EOF and hangs
+    #   * redirect all three descriptors and use setsid, so the exploit cannot
+    #     hold the pty either
+    $launch = "cd $TMP; rm -f $runLog; " +
+              "setsid env $envPrefix $REMOTE_BIN --auto > $runLog 2>&1 < /dev/null & echo LAUNCHED"
+    $launched = Sh $adb $serial $launch
+    if ($launched -notmatch 'LAUNCHED') {
+        Warn "could not start the exploit: $launched"
+        continue
+    }
+
+    # Poll for root, but stop early once the run reaches a terminal marker, so a
+    # failed attempt is retried promptly and a finished one is not restarted.
+    $rootId = $null
+    $deadline = (Get-Date).AddSeconds($AttemptTimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $who = Sh $adb $serial 'su -c id'
+        if ($who -match 'uid=0\(root\)') { $rootId = $who; break }
+        $tail = Sh $adb $serial "tail -1 $runLog 2>/dev/null"
+        if ($tail -match 'FAIL_EXIT=|LATE_LOAD_SHELL_RC=|LATE_LOAD_RC=|parking without reap') { break }
+    }
+
+    # The log can reach LATE_LOAD_SHELL_RC= a moment before the freshly loaded
+    # module actually answers su, so a failed poll here is not a failed run.
+    # Give ksud a short window to register before believing it.
+    if (-not $rootId) {
+        for ($k = 0; $k -lt 8; $k++) {
+            Start-Sleep -Seconds 2
+            $who = Sh $adb $serial 'su -c id'
+            if ($who -match 'uid=0\(root\)') { $rootId = $who; break }
+        }
+    }
+
+    $out = Sh $adb $serial "cat $runLog 2>/dev/null"
     foreach ($line in ($out -split "`n")) {
-        if ($line -match 'stage |burst|PLANT_CRED|PARKED|LATE_LOAD|FAIL=|child report|panic_on_warn|missed|holding zombie') {
+        if ($line -match 'stage |burst|PLANT_CRED|PARKED|LATE_LOAD|FAIL|child report|holding zombie|PROBE_TIMER_FAIL') {
             $colour = 'DarkGray'
             if ($line -match 'burst hit=1') { $colour = 'Green' }
-            if ($line -match 'hit=0|FAIL=|missed|holding zombie') { $colour = 'Red' }
+            if ($line -match 'hit=0|-FAIL|FAIL=|missed|holding zombie') { $colour = 'Red' }
             if ($line -match 'PLANT_CRED_OK|LATE_LOAD_RC=0') { $colour = 'Green' }
             Write-Host "    $line" -ForegroundColor $colour
         }
     }
 
-    Start-Sleep -Seconds 2
-    $id = Sh $adb $serial 'su -c id'
-    if ($id -match 'uid=0\(root\)') {
+    if ($rootId) {
         $succeeded = $true
         break
     }
 
+    # Give the process a moment to exit before deciding whether a retry is safe.
+    Start-Sleep -Seconds 3
+    if (Get-ExploitPid) {
+        Warn 'the run ended without root and left a parked holder process.'
+        Info 'retrying now would run two instances over the same pages.'
+        Info 'reboot, then run this script again:   adb reboot'
+        $stoppedOnHolder = $true
+        break
+    }
+
     if ($i -lt $MaxAttempts) {
-        Info 'the last stage is a probabilistic page reclaim - retrying is the documented fix'
+        Info 'no root, and the process exited cleanly - retrying'
     }
 }
 
 if (-not $succeeded) {
     Head 'failed'
-    Bad "no root after $MaxAttempts attempts"
+
+    if ($stoppedOnHolder) {
+        Bad "stopped after $attemptsMade attempt(s): a parked holder is still alive"
+        Say ''
+        Say '  The exploit is probabilistic (roughly 2 of 3 per the notes), and a failed' 'DarkGray'
+        Say '  stage parks the same holder a successful one leaves behind. Running again' 'DarkGray'
+        Say '  on top of it puts two instances over the same pages, so this script stops.' 'DarkGray'
+        Say ''
+        Say '  Reboot to clear the holder, then run it again:' 'DarkGray'
+        Say '    adb reboot;  .\scripts\root.ps1' 'DarkGray'
+    }
+    else {
+        Bad "no root after $attemptsMade attempt(s)"
+        Say ''
+        Say '  Every attempt exited cleanly, so retrying is safe:' 'DarkGray'
+        Say '    .\scripts\root.ps1 -MaxAttempts 8' 'DarkGray'
+    }
+
     Say ''
-    Say '  The exploit is probabilistic; more attempts may still work:' 'DarkGray'
-    Say "    .\scripts\root.ps1 -MaxAttempts 8" 'DarkGray'
-    Say ''
-    Say '  If a run left a PARKED holder, do NOT kill it - it holds a fake cred page' 'DarkGray'
-    Say '  and killing it can panic the kernel. Reboot instead:' 'DarkGray'
-    Say '    adb reboot' 'DarkGray'
+    Say '  Never kill a parked holder by hand - it holds a fake cred page and' 'DarkGray'
+    Say '  killing it can panic the kernel.' 'DarkGray'
     exit 1
 }
 
