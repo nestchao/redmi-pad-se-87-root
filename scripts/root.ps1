@@ -262,7 +262,7 @@ if (-not $SkipPush) {
             Info "$label  up to date"
         }
         else {
-            if (-not $have) { Info "$label  missing on device (tmp is cleaned on boot)" }
+            if (-not $have) { Info "$label  missing on device - pushing it" }
             else { Info "$label  stale" }
             & $adb -s $serial push $local $remote 2>&1 | Out-Null
             $have = Get-RemoteHash $adb $serial $remote

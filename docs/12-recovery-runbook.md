@@ -168,7 +168,7 @@ adb shell "echo 0 > /sys/kernel/tracing/trace"
 
 | 项 | 说明 |
 |---|---|
-| `/data/local/tmp` 占用 **1.8 GB** | 主要是历史项目留下的大文件（`ipogo261.apk`、`mcd.apk`、各种 `.bin` dump）。**不影响 exploit 竞态**，但会吃存储。要清理自己确认后再删，别误删还在用的。 |
+| `/data/local/tmp` 占用 ~1.7 GB | 主要是历史项目留下的大文件（`ipogo261.apk`、`mcd.apk`、各种 `.bin` dump）。在 106 GB 的 `/data` 里只占 **1.7%**（还剩 77 GB），**不构成问题，可以不管**。和 exploit 竞态无关。 |
 | KSU 模块 `rezygisk`、`pgs` | 只在 **root 加载之后**才生效（`ksud late-load` 之后），所以**不参与 exploit 的页回收竞态**。但 `rezygisk` 是 Zygisk 实现，注入所有应用进程，对日常稳定性和性能有影响；不需要的话可以在 KernelSU 管理器里停用。 |
 
 ---
@@ -183,7 +183,7 @@ adb push D:\Projects\1.testing\xiaomi\artifacts\ksud-3.3.1              /data/lo
 adb shell chmod 755 /data/local/tmp/shark66118 /data/local/tmp/ksud33
 ```
 
-> `/data/local/tmp` 会被系统清理，重启后可能就没了。脚本每次按 SHA256 判断，只推缺失的。
+> `/data/local/tmp` **不会**被系统定期清理 —— 实测里 11-01 放进去的文件至今还在。但同一个路径可能被别的工具覆盖或替换，所以脚本每次按 SHA256 比对、必要时重推。
 
 ### 5.2 自检（零风险，不触发 UAF）
 
