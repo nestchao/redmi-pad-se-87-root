@@ -480,6 +480,16 @@ elseif ($bufAfter) {
     Info ("  trace buffer: {0} kB (already large)" -f $bufAfter)
 }
 
+# The ring buffer keeps records from earlier runs; thousands of stale lines make
+# every scan read history before reaching the free we are hunting for.  Writing
+# to the trace file clears it, and the shell user is allowed to do that here.
+$stale = Sh $adb $serial 'wc -l < /sys/kernel/tracing/trace 2>/dev/null'
+if ($stale -match '^\d+$' -and [int]$stale -gt 1000) {
+    Sh $adb $serial 'echo 0 > /sys/kernel/tracing/trace 2>/dev/null' | Out-Null
+    $left = Sh $adb $serial 'wc -l < /sys/kernel/tracing/trace 2>/dev/null'
+    Info ("  trace records: {0:N0} stale -> cleared ({1} left)" -f [int]$stale, $left)
+}
+
 for ($i = 1; $i -le $MaxAttempts; $i++) {
     $attemptsMade = $i
     Say ''

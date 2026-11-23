@@ -137,6 +137,40 @@ adb reboot
 
 > **实测**：这四项开着时连续 4 次 `stage fake_cred` 全失败；清理后**第一次就成功**（25.9 秒）。
 
+### 4.5 环境自检清单（跑之前对一遍）
+
+```powershell
+# 这几个必须是这些值
+adb shell settings get secure accessibility_enabled               # 0
+adb shell settings get secure enabled_accessibility_services      # null
+adb shell settings get global adb_wifi_enabled                    # 0
+adb shell getprop persist.traced.enable                           # 0
+adb shell getprop debug.atrace.tags.enableflags                   # 0
+
+# 这些进程不应该存在
+adb shell "ps -A -o PID,NAME | grep -iE 'traced|perfetto|shark_shell'"
+
+# trace 状态：tracing_on 必须 0，buffer 越大越好
+adb shell cat /sys/kernel/tracing/tracing_on                      # 0
+adb shell cat /sys/kernel/tracing/buffer_size_kb                  # 4099（脚本会调大）
+adb shell "wc -l < /sys/kernel/tracing/trace"                     # 越小越好
+```
+
+**trace buffer 可以清空，而且 shell 权限就够**（这是实测确认的）：
+
+```powershell
+adb shell "echo 0 > /sys/kernel/tracing/trace"
+```
+
+`buffer_size_kb` 也能被 shell 写大（实测 `echo 4096 > …` 生效）。**脚本这两件事都会自动做。**
+
+### 4.6 不影响 exploit、但值得知道的两件事
+
+| 项 | 说明 |
+|---|---|
+| `/data/local/tmp` 占用 **1.8 GB** | 主要是历史项目留下的大文件（`ipogo261.apk`、`mcd.apk`、各种 `.bin` dump）。**不影响 exploit 竞态**，但会吃存储。要清理自己确认后再删，别误删还在用的。 |
+| KSU 模块 `rezygisk`、`pgs` | 只在 **root 加载之后**才生效（`ksud late-load` 之后），所以**不参与 exploit 的页回收竞态**。但 `rezygisk` 是 Zygisk 实现，注入所有应用进程，对日常稳定性和性能有影响；不需要的话可以在 KernelSU 管理器里停用。 |
+
 ---
 
 ## 5. 完整手动流程（想搞清每一步时用）
