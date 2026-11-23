@@ -438,6 +438,28 @@ if ($busy) {
 # before they are read. Neither is required, both are cheap.
 Say ''
 Info 'preparing the machine'
+
+# Competition that measurably breaks the reclaim: an enabled accessibility
+# service, wireless debugging and a lingering shark_shell each keep allocating
+# and writing to the trace ring buffer. With them on, stage 1 failed 4 times in
+# a row with "burst hit=0 after ~3150ms"; with them off the next run succeeded
+# on the first attempt. Turn them off, but say so rather than doing it silently.
+$noise = @()
+if ((Sh $adb $serial 'settings get secure accessibility_enabled') -eq '1') {
+    Sh $adb $serial 'settings put secure accessibility_enabled 0' | Out-Null
+    Sh $adb $serial 'settings put secure enabled_accessibility_services null' | Out-Null
+    $noise += 'accessibility'
+}
+if ((Sh $adb $serial 'settings get global adb_wifi_enabled') -eq '1') {
+    Sh $adb $serial 'settings put global adb_wifi_enabled 0' | Out-Null
+    $noise += 'wireless debugging'
+}
+if (Sh $adb $serial 'pidof shark_shell 2>/dev/null') {
+    Sh $adb $serial 'pkill -f shark_shell' | Out-Null
+    $noise += 'shark_shell'
+}
+if ($noise.Count) { Info ("  turned off: {0}" -f ($noise -join ', ')) }
+
 $mem = @()
 foreach ($step in @('before', 'after')) {
     $v = Sh $adb $serial "awk '/^MemFree/{print `$2}' /proc/meminfo"
